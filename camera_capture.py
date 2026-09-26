@@ -8,7 +8,7 @@ IMPORTANT CONTEXT:
 SkinCode is deployed as an API service for web/mobile browsers. Camera
 capture in production happens on the CLIENT (browser via getUserMedia +
 Canvas), NOT on the server. This file is NOT meant to run in production —
-it exists so you can prototype and test the capture -> quality gate ->
+it exists so you can prototype and test the capture -> upload check ->
 retry flow locally with a laptop webcam before porting the logic to
 JavaScript.
 
@@ -212,13 +212,16 @@ def capture_with_countdown(
 
 
 # ---------------------------------------------------------------------------
-# 4. CAPTURE + QUALITY GATE + RETRY LOOP
+# 4. CAPTURE + UPLOAD CHECK + RETRY LOOP
 # ---------------------------------------------------------------------------
 # Browser equivalent: after canvas.toBlob() produces the JPEG, POST it to
-# the /analyze endpoint. If the backend responds with a quality-gate
-# rejection (see quality_gate.py's QualityCheckResult), show the
-# rejection message to the user and re-open the countdown/capture UI for
-# another attempt, up to max_retries.
+# the /analyze endpoint. The backend only validates file size and minimum
+# resolution itself (see main.py's validate_image_for_perfect_corp) —
+# actual photo-quality rejection (blur, no face, bad pose, etc.) now
+# happens on Perfect Corp's side at no extra cost. If the backend
+# responds with a 422 rejection either way, show the rejection message
+# to the user and re-open the countdown/capture UI for another attempt,
+# up to max_retries.
 
 def capture_with_retry(
     config: CaptureConfig = DEFAULT_CAPTURE_CONFIG,
@@ -231,10 +234,10 @@ def capture_with_retry(
     Args:
         config: capture configuration
         quality_check_fn: a function that takes JPEG bytes and returns
-            (passed, message). In production this would call
-            quality_gate.run_quality_gate() directly, or hit the backend
-            /analyze endpoint over HTTP. Left as a callback here so this
-            file has no hard dependency on quality_gate.py.
+            (passed, message). In production this would hit the backend
+            /analyze endpoint over HTTP and inspect the response status
+            (202 = accepted, 422 = rejected). Left as a callback here so
+            this file has no hard dependency on the backend.
 
     Returns:
         CaptureResult with the final status and image bytes (if successful)
@@ -282,8 +285,8 @@ def capture_with_retry(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Standalone test: capture with countdown, no quality gate wired up.
-    # To test the full flow with quality_gate.py, see the commented
+    # Standalone test: capture with countdown, no upload check wired up.
+    # To test the full flow against the backend, see the commented
     # example below.
     result = capture_with_retry(DEFAULT_CAPTURE_CONFIG)
 
@@ -295,16 +298,18 @@ if __name__ == "__main__":
             f.write(result.image_bytes)
         print("Saved to captured_photo.jpg")
 
-    # --- Example wiring with quality_gate.py (uncomment to use) ---
-    # from quality_gate import run_quality_gate, FaceAnalyzer
-    #
-    # analyzer = FaceAnalyzer()
+    # --- Example wiring against the backend /analyze endpoint (uncomment to use) ---
+    # import httpx
     #
     # def quality_check_fn(image_bytes: bytes) -> tuple[bool, Optional[str]]:
-    #     check_result = run_quality_gate(image_bytes, face_analyzer=analyzer)
-    #     return check_result.passed, check_result.user_message()
+    #     response = httpx.post(
+    #         "http://localhost:8000/analyze",
+    #         files={"file": ("photo.jpg", image_bytes, "image/jpeg")},
+    #     )
+    #     if response.status_code == 202:
+    #         return True, None
+    #     return False, response.json().get("message")
     #
     # result = capture_with_retry(
     #     DEFAULT_CAPTURE_CONFIG, quality_check_fn=quality_check_fn
     # )
-    # analyzer.close()
