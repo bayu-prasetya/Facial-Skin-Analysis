@@ -17,15 +17,24 @@ Flow for POST /analyze:
     6. Return 202 Accepted immediately with the analysis_id, so the
        client isn't blocked waiting for the vendor API round-trip
 
-GET /analyze/{analysis_id} is what actually drives progress: each call
-performs a single Perfect Corp status check (no internal loop) if the
-analysis is still "pending" with a task_id on file, and updates Supabase
-to "completed"/"failed" once Perfect Corp is done. The client is expected
-to call this endpoint repeatedly (its own polling loop) until the status
-stops being "pending". The moment a call observes the task succeeding,
-product recommendations are computed right there too and stored alongside
-the skin metrics — so by the time the client sees status="completed",
-recommendations are already sitting in the record.
+Perfect Corp can also push a webhook (POST /webhooks/perfect-corp) the
+moment a task finishes — configured separately in their API Console
+dashboard, not in this code. That's now the primary way a "pending"
+analysis gets resolved. The webhook payload only carries {task_id,
+task_status} though, not the actual results, so the handler still does
+one Perfect Corp status check to fetch them (same check_skin_analysis_task
+used by the polling fallback below).
+
+GET /analyze/{analysis_id} is the fallback path: each call performs a
+single Perfect Corp status check (no internal loop) if the analysis is
+still "pending" with a task_id on file, and updates Supabase to
+"completed"/"failed" once Perfect Corp is done. This covers the case
+where the webhook is delayed, dropped, or not configured (e.g. no public
+URL during local development). Whichever path (webhook or polling) first
+observes the task succeeding computes product recommendations right there
+too and stores them alongside the skin metrics — so by the time the
+client sees status="completed", recommendations are already sitting in
+the record.
 
 GET /analyze/{analysis_id}/recommendations just reads that stored value
 (computing it on the fly as a fallback for older records). Recommendation
@@ -38,19 +47,23 @@ pipeline is unnecessary — the only thing we still need to check
 ourselves is what's required to even make a valid SD-tier request.
 
 Dependencies:
-    pip install fastapi python-multipart httpx supabase Pillow python-dotenv --break-system-packages
+    pip install fastapi python-multipart httpx supabase Pillow python-dotenv svix --break-system-packages
 
 Environment variables required (see .env.example — copy it to .env and
 fill in real values; .env is loaded automatically on startup):
     SUPABASE_URL, SUPABASE_KEY          - Supabase project credentials
     PERFECT_CORP_API_KEY                - Perfect Corp YouCam vendor key
     PERFECT_CORP_API_BASE_URL           - Perfect Corp API base URL
+    PERFECT_CORP_WEBHOOK_SECRET         - webhook signing secret ("whsec_...")
+                                           from Perfect Corp's API Console
+                                           Webhook Management page
 
 Run locally:
     uvicorn main:app --reload
 """
 
 import io
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -58,11 +71,12 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
 from PIL import Image
 from pydantic import BaseModel
 from supabase import create_client, Client
+from svix.webhooks import Webhook, WebhookVerificationError
 
 load_dotenv()
 
@@ -224,6 +238,18 @@ def _get_analysis_record(analysis_id: str) -> dict:
     return result.data[0]
 
 
+def _find_analysis_by_task_id(task_id: str) -> Optional[dict]:
+    """Look up a skin_analyses row by its Perfect Corp task_id (used by the webhook handler,
+    which only receives a task_id — not our analysis_id). Returns None if not found."""
+    result = (
+        _supabase_client.table("skin_analyses")
+        .select("*")
+        .eq("task_id", task_id)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
 # ---------------------------------------------------------------------------
 # 5. PERFECT CORP CLIENT
 # ---------------------------------------------------------------------------
@@ -251,21 +277,21 @@ def _get_analysis_record(analysis_id: str) -> dict:
 # versions) must NOT be mixed in here — SD and HD concern params can't be
 # combined in the same request (API returns InvalidParameters if you do).
 PERFECT_CORP_SKIN_ANALYSIS_ACTIONS = [
-    # "wrinkle",
-    # "droopy_upper_eyelid",
-    # "droopy_lower_eyelid",
-    # "firmness",
-    # "acne",
-    # "moisture",
-    # "eye_bag",
-    # "dark_circle_v2",
-    # "age_spot",
-    # "radiance",
-    # "redness",
-    # "oiliness",
-    # "pore",
-    # "texture",
-    # "tear_trough",
+    "wrinkle",
+    "droopy_upper_eyelid",
+    "droopy_lower_eyelid",
+    "firmness",
+    "acne",
+    "moisture",
+    "eye_bag",
+    "dark_circle_v2",
+    "age_spot",
+    "radiance",
+    "redness",
+    "oiliness",
+    "pore",
+    "texture",
+    "tear_trough",
     "skin_type",
 ]
 
@@ -588,6 +614,45 @@ async def get_product_recommendations(analysis_id: str):
         )
 
     return {"analysis_id": analysis_id, "recommendations": recommendations}
+
+
+@app.post("/webhooks/perfect-corp")
+async def perfect_corp_webhook(request: Request):
+    """
+    Receive Perfect Corp's task-completion webhook (configured separately
+    in their API Console — not in this code). The payload only carries
+    {task_id, task_status}, not the actual results, so this still performs
+    one Perfect Corp status check (check_skin_analysis_task) to fetch them
+    and persist the outcome — the same function the GET /analyze/{id}
+    polling fallback uses.
+
+    Uses the Standard Webhooks signature scheme (see the svix library) to
+    verify the request actually came from Perfect Corp before trusting it.
+    """
+    body = await request.body()
+
+    webhook_secret = os.environ.get("PERFECT_CORP_WEBHOOK_SECRET")
+    if not webhook_secret:
+        raise HTTPException(status_code=500, detail="Webhook secret is not configured.")
+
+    try:
+        Webhook(webhook_secret).verify(body, dict(request.headers))
+    except WebhookVerificationError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid webhook signature: {e}") from e
+
+    payload = json.loads(body)
+    task_id = payload.get("data", {}).get("task_id")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="Missing data.task_id in webhook payload.")
+
+    record = _find_analysis_by_task_id(task_id)
+    if record is not None and record["status"] == "pending":
+        await check_skin_analysis_task(record["id"], task_id)
+
+    # Always 200 once the signature checks out, even if we didn't find a
+    # matching (still-pending) record — so Perfect Corp doesn't retry
+    # forever over something that isn't a delivery problem on their end.
+    return {"status": "ok"}
 
 
 @app.get("/health")
