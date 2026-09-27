@@ -10,16 +10,28 @@ Flow for POST /analyze:
     2. Validate file size (<10MB) and minimum resolution (>=480px on the
        shortest side) required by Perfect Corp's SD tier
     3. If rejected -> return 422 immediately with the rejection reason
-    4. If passed -> insert a "pending" analysis record into Supabase
-    5. Schedule registering + submitting the Perfect Corp task as a
-       BackgroundTask (register file, upload it, create the analysis
-       task, store the resulting task_id — no polling here)
-    6. Return 202 Accepted immediately with the analysis_id, so the
-       client isn't blocked waiting for the vendor API round-trip
+    4. If passed -> register the file with Perfect Corp, upload it, and
+       create the analysis task, all inline (submit_skin_analysis_task)
+    5. Insert the analysis record into Supabase with the resulting
+       task_id already set, in a single write
+    6. Return 202 Accepted with the analysis_id
+
+Steps 4-5 are deliberately synchronous rather than a BackgroundTask. The
+task_id is the only handle that can ever retrieve a result, and Perfect
+Corp offers no way to list tasks or look one up by anything else, so a
+task_id that is created but never persisted is a permanently orphaned
+unit of quota. Submitting inline means the row is written with its
+task_id or not written at all: if any step fails, no record is created
+and the client gets the error straight away, instead of discovering it
+later by polling a row that can never be resolved. The cost is a few
+seconds of response latency, which the client would have spent polling
+anyway. Nothing here blocks the event loop — the vendor calls are async
+httpx and the Supabase write goes through a threadpool — so one worker
+still serves many concurrent uploads.
 
 Perfect Corp can also push a webhook (POST /webhooks/perfect-corp) the
 moment a task finishes — configured separately in their API Console
-dashboard, not in this code. That's now the primary way a "pending"
+dashboard, not in this code. That's the primary way a "pending"
 analysis gets resolved. The webhook payload only carries {task_id,
 task_status} though, not the actual results, so the handler still does
 one Perfect Corp status check to fetch them (same check_skin_analysis_task
@@ -27,7 +39,7 @@ used by the polling fallback below).
 
 GET /analyze/{analysis_id} is the fallback path: each call performs a
 single Perfect Corp status check (no internal loop) if the analysis is
-still "pending" with a task_id on file, and updates Supabase to
+still "pending", and updates Supabase to
 "completed"/"failed" once Perfect Corp is done. This covers the case
 where the webhook is delayed, dropped, or not configured (e.g. no public
 URL during local development). Whichever path (webhook or polling) first
@@ -72,15 +84,7 @@ from typing import Literal, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import (
-    BackgroundTasks,
-    FastAPI,
-    File,
-    HTTPException,
-    Path,
-    Request,
-    UploadFile,
-)
+from fastapi import FastAPI, File, HTTPException, Path, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -121,12 +125,18 @@ Facial skin analysis built on Perfect Corp's YouCam AI Skin API.
 Analysis is **asynchronous** — a photo takes several seconds to process, so
 `POST /analyze` does not return results. Instead:
 
-1. `POST /analyze` with the photo. You get back `202 Accepted` and an
-   `analysis_id` right away, or `422` if the photo can't be used.
+1. `POST /analyze` with the photo. This uploads it to Perfect Corp and queues
+   the analysis, which takes a few seconds, then returns `202 Accepted` with
+   an `analysis_id`.
 2. Poll `GET /analyze/{analysis_id}` until `status` is no longer `pending`.
    Every ~3 seconds is a reasonable cadence.
 3. On `status: "completed"`, read `skin_metrics`, `skin_age`,
    `skin_health_score`, and `recommendations` from that same response.
+
+Step 1 is all-or-nothing: either you get an `analysis_id` and an analysis
+exists, or you get an error and nothing was created. There is no state where
+you hold an `analysis_id` that can never produce a result, so any failed
+`POST /analyze` is safe to retry.
 
 Recommendations are already computed by the time `status` becomes
 `completed`, so step 3 needs no extra call. `GET /analyze/{analysis_id}/recommendations`
@@ -363,7 +373,7 @@ def validate_image_for_perfect_corp(image_bytes: bytes) -> dict:
 #     id uuid primary key,
 #     status text not null default 'pending',  -- pending | completed | failed
 #     quality_metrics jsonb,
-#     task_id text,
+#     task_id text not null,
 #     skin_metrics jsonb,
 #     skin_health_score integer,
 #     recommendations jsonb,
@@ -377,25 +387,20 @@ def validate_image_for_perfect_corp(image_bytes: bytes) -> dict:
 # would block the event loop for the whole Supabase round-trip, stalling
 # every other in-flight request.
 
-async def _create_pending_record(analysis_id: str, image_metadata: dict) -> None:
-    """Insert the initial 'pending' row before the background task starts."""
+async def _create_pending_record(
+    analysis_id: str, task_id: str, image_metadata: dict
+) -> None:
+    """Insert the 'pending' row for a task that has already been created at
+    Perfect Corp. task_id is written in this same insert on purpose — see the
+    module docstring on why it is never allowed to exist only in memory."""
     await run_in_threadpool(
         lambda: _supabase_client.table("skin_analyses").insert({
             "id": analysis_id,
             "status": "pending",
+            "task_id": task_id,
             "quality_metrics": image_metadata,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
-    )
-
-
-async def _mark_task_submitted(analysis_id: str, task_id: str) -> None:
-    """Record the Perfect Corp task_id once the task has been created; status stays 'pending'."""
-    await run_in_threadpool(
-        lambda: _supabase_client.table("skin_analyses").update({
-            "task_id": task_id,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", analysis_id).execute()
     )
 
 
@@ -509,11 +514,18 @@ def _build_analysis_response(record: dict) -> dict:
 #   3. POST /s2s/v2.0/task/skin-analysis -> create the analysis task, get task_id
 #   4. GET  /s2s/v2.0/task/skin-analysis/<task_id> -> check task_status
 #
-# Steps 1-3 happen once, in the background task right after upload
-# (submit_skin_analysis_task). Step 4 is NOT looped internally: it runs once
-# per trigger, either when Perfect Corp's webhook reports the task finished
-# (the primary path) or when a client calls GET /analyze/{analysis_id} (the
-# fallback, driven by the client's own polling cadence).
+# Steps 1-3 run inline during POST /analyze (submit_skin_analysis_task), so
+# the task_id reaches Supabase in the same request that created it. Step 4 is
+# NOT looped internally: it runs once per trigger, either when Perfect Corp's
+# webhook reports the task finished (the primary path) or when a client calls
+# GET /analyze/{analysis_id} (the fallback, driven by the client's own polling
+# cadence).
+#
+# Quota is consumed when a task reaches "success", not when it is created, and
+# tasks that end in "error" cost nothing (per Perfect Corp's integration
+# guide). So every rejection path here is free — but a task whose task_id we
+# lose still burns a unit once the engine finishes it, with no way to read the
+# result. That asymmetry is why steps 1-3 are not deferred.
 #
 # NOTE: response field names below (file_id, requests[].url/method, task_id,
 # task_status, results) are taken from Perfect Corp's published examples but
@@ -545,8 +557,20 @@ PERFECT_CORP_SKIN_ANALYSIS_ACTIONS = [
 ]
 
 
+# Per-call timeout for every Perfect Corp request. Steps 1-3 now run inside
+# POST /analyze, so the worst case a client can wait is three of these back to
+# back; keeping it well under a minute leaves room under any reverse proxy's
+# request timeout without having to know the exact figure.
+PERFECT_CORP_TIMEOUT_SECONDS = 15.0
+
+
 class PerfectCorpError(Exception):
     """Raised when the Perfect Corp API call fails or returns unexpected data."""
+
+
+class PerfectCorpTimeout(PerfectCorpError):
+    """Perfect Corp didn't answer in time. Separate from PerfectCorpError so
+    POST /analyze can distinguish 504 (vendor slow) from 502 (vendor refused)."""
 
 
 def _get_perfect_corp_credentials() -> tuple[str, str]:
@@ -573,10 +597,14 @@ async def _register_file(
         )
         response.raise_for_status()
     except httpx.TimeoutException as e:
-        raise PerfectCorpError(f"Perfect Corp file registration timed out: {e}") from e
+        raise PerfectCorpTimeout(f"Perfect Corp file registration timed out: {e}") from e
     except httpx.HTTPStatusError as e:
         raise PerfectCorpError(
             f"Perfect Corp file registration returned {e.response.status_code}: {e.response.text}"
+        ) from e
+    except httpx.RequestError as e:
+        raise PerfectCorpError(
+            f"Could not reach Perfect Corp for file registration: {e!r}"
         ) from e
 
     try:
@@ -600,10 +628,14 @@ async def _upload_file(
         )
         response.raise_for_status()
     except httpx.TimeoutException as e:
-        raise PerfectCorpError(f"Perfect Corp file upload timed out: {e}") from e
+        raise PerfectCorpTimeout(f"Perfect Corp file upload timed out: {e}") from e
     except httpx.HTTPStatusError as e:
         raise PerfectCorpError(
             f"Perfect Corp file upload returned {e.response.status_code}: {e.response.text}"
+        ) from e
+    except httpx.RequestError as e:
+        raise PerfectCorpError(
+            f"Could not reach Perfect Corp for file upload: {e!r}"
         ) from e
 
 
@@ -621,10 +653,14 @@ async def _create_skin_analysis_task(client: httpx.AsyncClient, api_key: str, fi
         )
         response.raise_for_status()
     except httpx.TimeoutException as e:
-        raise PerfectCorpError(f"Perfect Corp task creation timed out: {e}") from e
+        raise PerfectCorpTimeout(f"Perfect Corp task creation timed out: {e}") from e
     except httpx.HTTPStatusError as e:
         raise PerfectCorpError(
             f"Perfect Corp task creation returned {e.response.status_code}: {e.response.text}"
+        ) from e
+    except httpx.RequestError as e:
+        raise PerfectCorpError(
+            f"Could not reach Perfect Corp for task creation: {e!r}"
         ) from e
 
     try:
@@ -643,10 +679,14 @@ async def _fetch_skin_analysis_task(client: httpx.AsyncClient, api_key: str, tas
         )
         response.raise_for_status()
     except httpx.TimeoutException as e:
-        raise PerfectCorpError(f"Perfect Corp task status check timed out: {e}") from e
+        raise PerfectCorpTimeout(f"Perfect Corp task status check timed out: {e}") from e
     except httpx.HTTPStatusError as e:
         raise PerfectCorpError(
             f"Perfect Corp task status check returned {e.response.status_code}: {e.response.text}"
+        ) from e
+    except httpx.RequestError as e:
+        raise PerfectCorpError(
+            f"Could not reach Perfect Corp for task status check: {e!r}"
         ) from e
 
     try:
@@ -666,7 +706,7 @@ async def submit_skin_analysis_task(image_bytes: bytes, filename: str, content_t
     """
     api_key, base_url = _get_perfect_corp_credentials()
 
-    async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=base_url, timeout=PERFECT_CORP_TIMEOUT_SECONDS) as client:
         file_id, upload_url, upload_method = await _register_file(
             client, api_key, filename, content_type, len(image_bytes)
         )
@@ -684,7 +724,7 @@ async def check_skin_analysis_task(analysis_id: str, task_id: str) -> dict:
     """
     try:
         api_key, base_url = _get_perfect_corp_credentials()
-        async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
+        async with httpx.AsyncClient(base_url=base_url, timeout=PERFECT_CORP_TIMEOUT_SECONDS) as client:
             data = await _fetch_skin_analysis_task(client, api_key, task_id)
     except PerfectCorpError as e:
         await _mark_failed(analysis_id, str(e))
@@ -745,38 +785,7 @@ def compute_product_recommendations(skin_metrics: dict, skin_health_score: Optio
 
 
 # ---------------------------------------------------------------------------
-# 7. BACKGROUND TASK
-# ---------------------------------------------------------------------------
-
-async def process_analysis(analysis_id: str, image_bytes: bytes, filename: str, content_type: str) -> None:
-    """
-    Runs after the response has already been sent to the client. Registers
-    the photo with Perfect Corp and creates the analysis task (steps 1-3),
-    then stores the task_id on the record — status stays "pending".
-
-    The task's completion is checked lazily by GET /analyze/{analysis_id}
-    (one Perfect Corp status check per client call) rather than by this
-    background task looping/sleeping until it's done.
-
-    NOTE: FastAPI's BackgroundTasks has no built-in retry or persistence —
-    if this task crashes before storing a task_id, the analysis stays
-    stuck in "pending" unless _mark_failed is reached. This is an accepted
-    limitation for the current stage; a retry/queue mechanism is a future
-    improvement once traffic justifies the added infrastructure.
-    """
-    try:
-        task_id = await submit_skin_analysis_task(image_bytes, filename, content_type)
-        await _mark_task_submitted(analysis_id, task_id)
-    except PerfectCorpError as e:
-        await _mark_failed(analysis_id, str(e))
-    except Exception as e:
-        # Catch-all so an unexpected error still leaves a clear failure
-        # record instead of leaving the analysis stuck in "pending" forever.
-        await _mark_failed(analysis_id, f"Unexpected error: {e}")
-
-
-# ---------------------------------------------------------------------------
-# 8. MAIN ENDPOINT
+# 7. MAIN ENDPOINT
 # ---------------------------------------------------------------------------
 
 @app.post(
@@ -787,9 +796,13 @@ async def process_analysis(analysis_id: str, image_bytes: bytes, filename: str, 
     summary="Submit a photo for analysis",
     description=(
         "Upload a face photo as `multipart/form-data` under the field name `file`.\n\n"
-        "Returns `202` with an `analysis_id` as soon as the photo passes the upload "
-        "checks — it does **not** wait for the analysis itself. Poll "
-        "`GET /analyze/{analysis_id}` to get the results.\n\n"
+        "This call uploads the photo to Perfect Corp and queues the analysis task "
+        "before responding, so expect it to take a few seconds. It returns `202` "
+        "with an `analysis_id` once the task is queued — it does **not** wait for "
+        "the analysis itself. Poll `GET /analyze/{analysis_id}` for the results.\n\n"
+        "A non-2xx response means no analysis was created at all: there is nothing "
+        "to poll, and retrying is safe. Only after you receive an `analysis_id` "
+        "does an analysis exist.\n\n"
         "The photo must be at most 10 MB and at least 480px on its shortest side. "
         "A photo that fails either check is rejected with `422` and costs nothing. "
         "Whether the photo actually contains a usable face is determined later by "
@@ -805,19 +818,28 @@ async def process_analysis(analysis_id: str, image_bytes: bytes, filename: str, 
             "description": "Photo doesn't meet the size or resolution requirements.",
         },
         500: {"model": ErrorDetail, "description": "Could not record the analysis."},
+        502: {
+            "model": ErrorDetail,
+            "description": "Perfect Corp refused the upload or returned an error. Safe to retry.",
+        },
+        504: {
+            "model": ErrorDetail,
+            "description": "Perfect Corp didn't respond in time. Safe to retry.",
+        },
     },
 )
 async def analyze_photo(
     request: Request,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(
         description="Face photo. JPEG or PNG, max 10 MB, min 480px on the shortest side.",
     ),
 ):
     """
     Accept a photo upload, validate it meets Perfect Corp's SD-tier
-    requirements, and — if it passes — kick off the Perfect Corp
-    analysis in the background.
+    requirements, submit it to Perfect Corp, and record the resulting task.
+
+    Everything here is synchronous so that the task_id is persisted in the
+    same request that created it — see the module docstring.
     """
     content_length = request.headers.get("content-length")
     if content_length and int(content_length) > MAX_REQUEST_BODY_BYTES:
@@ -834,27 +856,34 @@ async def analyze_photo(
             content=AnalysisRejected(message=e.message).model_dump(),
         )
 
-    # --- Stage 2: create the pending record before returning ---
+    # --- Stage 2: register, upload, and create the task at Perfect Corp ---
+    try:
+        task_id = await submit_skin_analysis_task(
+            image_bytes,
+            file.filename or "photo.jpg",
+            file.content_type or "image/jpeg",
+        )
+    except PerfectCorpTimeout as e:
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except PerfectCorpError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    # --- Stage 3: persist the task_id in the same request that created it ---
     analysis_id = str(uuid.uuid4())
     try:
-        await _create_pending_record(analysis_id, image_metadata)
+        await _create_pending_record(analysis_id, task_id, image_metadata)
     except Exception as e:
-        # If we can't even create the record, don't schedule a background
-        # task that will have nothing to update — fail loudly instead.
+        # The task exists at Perfect Corp but we failed to record its id, so it
+        # can never be read back. Name the orphaned task_id in the error: it's
+        # the only trace left for reconciling against Perfect Corp's usage.
         raise HTTPException(
-            status_code=500, detail=f"Failed to create analysis record: {e}"
+            status_code=500,
+            detail=(
+                f"Analysis task {task_id} was created at Perfect Corp but could "
+                f"not be recorded: {e}"
+            ),
         ) from e
 
-    # --- Stage 3: schedule the expensive work for after the response ---
-    background_tasks.add_task(
-        process_analysis,
-        analysis_id,
-        image_bytes,
-        file.filename or "photo.jpg",
-        file.content_type or "image/jpeg",
-    )
-
-    # --- Stage 4: respond immediately, client doesn't wait for Perfect Corp ---
     return AnalysisAccepted(analysis_id=analysis_id)
 
 
@@ -880,16 +909,18 @@ async def get_analysis_result(
 ):
     """
     Polling endpoint for the client to check on a previously submitted
-    analysis. If it's still "pending" and a Perfect Corp task_id has been
-    recorded, this performs a single status check against Perfect Corp
-    (see check_skin_analysis_task) and updates Supabase accordingly —
-    the client is expected to call this repeatedly until the status is
-    no longer "pending". Returns a trimmed view (see _build_analysis_response)
-    rather than the raw Supabase row.
+    analysis. If it's still "pending", this performs a single status check
+    against Perfect Corp (see check_skin_analysis_task) and updates Supabase
+    accordingly — the client is expected to call this repeatedly until the
+    status is no longer "pending". Returns a trimmed view (see
+    _build_analysis_response) rather than the raw Supabase row.
+
+    Every row is written with its task_id (see _create_pending_record), so a
+    "pending" row always has one to check.
     """
     record = await _get_analysis_record(analysis_id)
 
-    if record["status"] == "pending" and record.get("task_id"):
+    if record["status"] == "pending":
         record = await check_skin_analysis_task(analysis_id, record["task_id"])
 
     return _build_analysis_response(record)
