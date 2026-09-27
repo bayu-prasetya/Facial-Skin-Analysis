@@ -68,15 +68,23 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Request
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    HTTPException,
+    Path,
+    Request,
+    UploadFile,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from svix.webhooks import Webhook, WebhookVerificationError
 
@@ -105,7 +113,74 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="SkinCode API", lifespan=lifespan)
+API_DESCRIPTION = """
+Facial skin analysis built on Perfect Corp's YouCam AI Skin API.
+
+## How an analysis flows
+
+Analysis is **asynchronous** — a photo takes several seconds to process, so
+`POST /analyze` does not return results. Instead:
+
+1. `POST /analyze` with the photo. You get back `202 Accepted` and an
+   `analysis_id` right away, or `422` if the photo can't be used.
+2. Poll `GET /analyze/{analysis_id}` until `status` is no longer `pending`.
+   Every ~3 seconds is a reasonable cadence.
+3. On `status: "completed"`, read `skin_metrics`, `skin_age`,
+   `skin_health_score`, and `recommendations` from that same response.
+
+Recommendations are already computed by the time `status` becomes
+`completed`, so step 3 needs no extra call. `GET /analyze/{analysis_id}/recommendations`
+exists if you want them on their own.
+
+## Status values
+
+| `status` | Meaning |
+| --- | --- |
+| `pending` | Still processing. Keep polling. |
+| `completed` | Done. Results are in the response. |
+| `failed` | Could not be analyzed. `error_message` says why. |
+
+A `failed` analysis is terminal — polling again won't change it. The most
+common cause is a photo Perfect Corp rejects on closer inspection (no face
+detected, face too small, too blurry), which the upload checks in step 1
+can't catch. Treat it as "ask the user for another photo".
+
+## Photo requirements
+
+- At most **10 MB**
+- At least **480px on the shortest side**
+- One clearly visible, front-facing face
+
+The first two are checked immediately and return `422`. The third is
+checked by Perfect Corp and surfaces later as `status: "failed"`.
+"""
+
+TAGS_METADATA = [
+    {
+        "name": "Analysis",
+        "description": "Submit a photo and retrieve its analysis results.",
+    },
+    {
+        "name": "Recommendations",
+        "description": "Product recommendations derived from a completed analysis.",
+    },
+    {
+        "name": "Webhooks",
+        "description": (
+            "Called by Perfect Corp, not by API clients. Documented here for "
+            "operators configuring the integration."
+        ),
+    },
+    {"name": "System", "description": "Liveness probes."},
+]
+
+app = FastAPI(
+    title="SkinCode API",
+    description=API_DESCRIPTION,
+    version="1.0.0",
+    openapi_tags=TAGS_METADATA,
+    lifespan=lifespan,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -114,15 +189,116 @@ app = FastAPI(title="SkinCode API", lifespan=lifespan)
 
 class AnalysisAccepted(BaseModel):
     """Returned immediately when the photo passes upload validation."""
-    analysis_id: str
+    analysis_id: str = Field(description="Poll GET /analyze/{analysis_id} with this id.")
     status: str = "pending"
     message: str = "Photo accepted, analysis in progress."
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "analysis_id": "3f9a1c2e-7b44-4d0a-9e51-2c8f6b1d4a77",
+                "status": "pending",
+                "message": "Photo accepted, analysis in progress.",
+            }
+        }
+    }
 
 
 class AnalysisRejected(BaseModel):
     """Returned when the photo fails upload validation."""
     status: str = "rejected"
-    message: str
+    message: str = Field(description="Which requirement the photo failed, in plain language.")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "status": "rejected",
+                "message": "Image resolution is too low (minimum 480px on the shortest side).",
+            }
+        }
+    }
+
+
+class QualityMetrics(BaseModel):
+    """Basic properties read off the uploaded photo."""
+    width: int
+    height: int
+    file_size_bytes: int
+
+
+class SkinMetric(BaseModel):
+    """One skin concern scored by Perfect Corp."""
+    type: str = Field(description='Concern name, e.g. "acne", "oiliness", "age_spot".')
+    ui_score: int = Field(description="Score for display, 0-100. Higher is better.")
+
+
+class AnalysisResult(BaseModel):
+    """Current state of an analysis. Shape is the same whether it's pending,
+    completed, or failed — the result fields are simply null until it completes."""
+    id: str
+    status: Literal["pending", "completed", "failed"]
+    quality_metrics: Optional[QualityMetrics] = None
+    skin_metrics: list[SkinMetric] = Field(
+        default_factory=list,
+        description="Per-concern scores. Empty until the analysis completes.",
+    )
+    skin_age: Optional[int] = Field(
+        default=None, description="Estimated skin age in years. Null until completed."
+    )
+    skin_health_score: Optional[int] = Field(
+        default=None,
+        description="Overall skin condition, 0-100. Null until completed.",
+    )
+    recommendations: Optional[list[dict]] = Field(
+        default=None, description="Recommended products. Null until completed."
+    )
+    error_message: Optional[str] = Field(
+        default=None, description='Why the analysis failed. Only set when status is "failed".'
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "id": "3f9a1c2e-7b44-4d0a-9e51-2c8f6b1d4a77",
+                "status": "completed",
+                "quality_metrics": {
+                    "width": 1080,
+                    "height": 1440,
+                    "file_size_bytes": 842113,
+                },
+                "skin_metrics": [
+                    {"type": "all", "ui_score": 78},
+                    {"type": "acne", "ui_score": 64},
+                    {"type": "oiliness", "ui_score": 71},
+                    {"type": "age_spot", "ui_score": 83},
+                    {"type": "skin_type", "ui_score": 69},
+                ],
+                "skin_age": 32,
+                "skin_health_score": 78,
+                "recommendations": [],
+                "error_message": None,
+            }
+        }
+    }
+
+
+class RecommendationsResult(BaseModel):
+    """Product recommendations for a completed analysis."""
+    analysis_id: str
+    recommendations: list[dict]
+
+
+class ErrorDetail(BaseModel):
+    """FastAPI's standard error shape."""
+    detail: str
+
+
+class HealthStatus(BaseModel):
+    status: str = "ok"
+
+
+class WebhookAck(BaseModel):
+    status: str = "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -607,12 +783,36 @@ async def process_analysis(analysis_id: str, image_bytes: bytes, filename: str, 
     "/analyze",
     response_model=AnalysisAccepted,
     status_code=202,
-    responses={422: {"model": AnalysisRejected}},
+    tags=["Analysis"],
+    summary="Submit a photo for analysis",
+    description=(
+        "Upload a face photo as `multipart/form-data` under the field name `file`.\n\n"
+        "Returns `202` with an `analysis_id` as soon as the photo passes the upload "
+        "checks — it does **not** wait for the analysis itself. Poll "
+        "`GET /analyze/{analysis_id}` to get the results.\n\n"
+        "The photo must be at most 10 MB and at least 480px on its shortest side. "
+        "A photo that fails either check is rejected with `422` and costs nothing. "
+        "Whether the photo actually contains a usable face is determined later by "
+        "Perfect Corp, and shows up as `status: \"failed\"` when you poll."
+    ),
+    responses={
+        413: {
+            "model": ErrorDetail,
+            "description": "Request body is too large to even read.",
+        },
+        422: {
+            "model": AnalysisRejected,
+            "description": "Photo doesn't meet the size or resolution requirements.",
+        },
+        500: {"model": ErrorDetail, "description": "Could not record the analysis."},
+    },
 )
 async def analyze_photo(
     request: Request,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    file: UploadFile = File(
+        description="Face photo. JPEG or PNG, max 10 MB, min 480px on the shortest side.",
+    ),
 ):
     """
     Accept a photo upload, validate it meets Perfect Corp's SD-tier
@@ -658,8 +858,26 @@ async def analyze_photo(
     return AnalysisAccepted(analysis_id=analysis_id)
 
 
-@app.get("/analyze/{analysis_id}")
-async def get_analysis_result(analysis_id: str):
+@app.get(
+    "/analyze/{analysis_id}",
+    response_model=AnalysisResult,
+    tags=["Analysis"],
+    summary="Get analysis results (poll this)",
+    description=(
+        "Returns the current state of an analysis. Call this repeatedly until "
+        "`status` is `completed` or `failed` — roughly every 3 seconds.\n\n"
+        "While `status` is `pending`, the result fields are `null` or empty. Once "
+        "`status` is `completed`, `skin_metrics`, `skin_age`, `skin_health_score`, "
+        "and `recommendations` are all populated. If `status` is `failed`, stop "
+        "polling and read `error_message` — it will not recover.\n\n"
+        "Each call may trigger a status check against Perfect Corp, so don't poll "
+        "faster than once per second."
+    ),
+    responses={404: {"model": ErrorDetail, "description": "No such analysis_id."}},
+)
+async def get_analysis_result(
+    analysis_id: str = Path(description="The id returned by POST /analyze."),
+):
     """
     Polling endpoint for the client to check on a previously submitted
     analysis. If it's still "pending" and a Perfect Corp task_id has been
@@ -677,8 +895,29 @@ async def get_analysis_result(analysis_id: str):
     return _build_analysis_response(record)
 
 
-@app.get("/analyze/{analysis_id}/recommendations")
-async def get_product_recommendations(analysis_id: str):
+@app.get(
+    "/analyze/{analysis_id}/recommendations",
+    response_model=RecommendationsResult,
+    tags=["Recommendations"],
+    summary="Get product recommendations only",
+    description=(
+        "Returns just the recommendations for a completed analysis.\n\n"
+        "You usually don't need this — `GET /analyze/{analysis_id}` already includes "
+        "`recommendations` once the analysis completes. Use this when you want them "
+        "without the rest of the payload.\n\n"
+        "Requires `status` to be `completed`; returns `409` otherwise."
+    ),
+    responses={
+        404: {"model": ErrorDetail, "description": "No such analysis_id."},
+        409: {
+            "model": ErrorDetail,
+            "description": "Analysis is still pending, or it failed.",
+        },
+    },
+)
+async def get_product_recommendations(
+    analysis_id: str = Path(description="The id of a completed analysis."),
+):
     """
     Return product recommendations for a completed analysis. These are
     computed once — the moment GET /analyze/{analysis_id} observes the
@@ -703,7 +942,29 @@ async def get_product_recommendations(analysis_id: str):
     return {"analysis_id": analysis_id, "recommendations": recommendations}
 
 
-@app.post("/webhooks/perfect-corp")
+@app.post(
+    "/webhooks/perfect-corp",
+    response_model=WebhookAck,
+    tags=["Webhooks"],
+    summary="Perfect Corp task-completion callback",
+    description=(
+        "**Not for API clients.** Perfect Corp calls this when an analysis task "
+        "finishes; the URL is registered in their API Console, not here.\n\n"
+        "Requests must be signed with the "
+        "[Standard Webhooks](https://www.standardwebhooks.com/) scheme using the "
+        "secret from Perfect Corp's Webhook Management page. Unsigned or "
+        "mis-signed requests get `401`.\n\n"
+        "Responds `503` when the callback can't be resolved yet — the task isn't "
+        "on record, or Perfect Corp still reports it as running — so the delivery "
+        "is retried rather than dropped."
+    ),
+    responses={
+        400: {"model": ErrorDetail, "description": "Payload is malformed or missing task_id."},
+        401: {"model": ErrorDetail, "description": "Signature verification failed."},
+        500: {"model": ErrorDetail, "description": "Webhook secret is not configured."},
+        503: {"model": ErrorDetail, "description": "Not resolvable yet — retry."},
+    },
+)
 async def perfect_corp_webhook(request: Request):
     """
     Receive Perfect Corp's task-completion webhook (configured separately
@@ -764,7 +1025,16 @@ async def perfect_corp_webhook(request: Request):
     return {"status": "ok"}
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    response_model=HealthStatus,
+    tags=["System"],
+    summary="Liveness check",
+    description=(
+        "Returns `200` whenever the process is up. Does not check Supabase or "
+        "Perfect Corp connectivity."
+    ),
+)
 async def health_check():
     """Basic liveness check for Cloud Run / load balancer probes."""
     return {"status": "ok"}
