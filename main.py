@@ -49,8 +49,8 @@ ourselves is what's required to even make a valid SD-tier request.
 Dependencies:
     pip install fastapi python-multipart httpx supabase Pillow python-dotenv svix --break-system-packages
 
-Environment variables required (see .env.example — copy it to .env and
-fill in real values; .env is loaded automatically on startup):
+Environment variables required (put these in a .env file in this directory;
+it's loaded automatically on startup and is gitignored):
     SUPABASE_URL, SUPABASE_KEY          - Supabase project credentials
     PERFECT_CORP_API_KEY                - Perfect Corp YouCam vendor key
     PERFECT_CORP_API_BASE_URL           - Perfect Corp API base URL
@@ -250,6 +250,52 @@ def _find_analysis_by_task_id(task_id: str) -> Optional[dict]:
     return result.data[0] if result.data else None
 
 
+def _find_metric_score(skin_metrics: dict, metric_type: str) -> Optional[float]:
+    """Find a top-level metric entry by type (e.g. "all", "skin_age") in
+    Perfect Corp's raw output array and return its "score"."""
+    for item in skin_metrics.get("output", []):
+        if item.get("type") == metric_type:
+            return item.get("score")
+    return None
+
+
+def _summarize_skin_metrics(skin_metrics: Optional[dict]) -> list[dict]:
+    """Reduce Perfect Corp's raw skin_metrics (its full "output" array, with
+    mask_urls, regions, etc.) down to just {type, ui_score} per concern —
+    the full raw payload stays in Supabase, this is only for API responses."""
+    if not skin_metrics:
+        return []
+    return [
+        {"type": item["type"], "ui_score": item["ui_score"]}
+        for item in skin_metrics.get("output", [])
+        if "ui_score" in item
+    ]
+
+
+def _extract_skin_age(skin_metrics: Optional[dict]) -> Optional[int]:
+    """Pull Perfect Corp's estimated skin_age metric out of the raw output array."""
+    if not skin_metrics:
+        return None
+    score = _find_metric_score(skin_metrics, "skin_age")
+    return round(score) if score is not None else None
+
+
+def _build_analysis_response(record: dict) -> dict:
+    """Shape a skin_analyses row into the trimmed public response for
+    GET /analyze/{analysis_id} — drops internal bookkeeping fields
+    (task_id, created_at, updated_at) and summarizes skin_metrics."""
+    return {
+        "id": record["id"],
+        "status": record["status"],
+        "quality_metrics": record.get("quality_metrics"),
+        "skin_metrics": _summarize_skin_metrics(record.get("skin_metrics")),
+        "skin_age": _extract_skin_age(record.get("skin_metrics")),
+        "skin_health_score": record.get("skin_health_score"),
+        "recommendations": record.get("recommendations"),
+        "error_message": record.get("error_message"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 5. PERFECT CORP CLIENT
 # ---------------------------------------------------------------------------
@@ -277,21 +323,21 @@ def _find_analysis_by_task_id(task_id: str) -> Optional[dict]:
 # versions) must NOT be mixed in here — SD and HD concern params can't be
 # combined in the same request (API returns InvalidParameters if you do).
 PERFECT_CORP_SKIN_ANALYSIS_ACTIONS = [
-    "wrinkle",
-    "droopy_upper_eyelid",
-    "droopy_lower_eyelid",
-    "firmness",
+    # "wrinkle",
+    # "droopy_upper_eyelid",
+    # "droopy_lower_eyelid",
+    # "firmness",
     "acne",
-    "moisture",
-    "eye_bag",
-    "dark_circle_v2",
+    # "moisture",
+    # "eye_bag",
+    # "dark_circle_v2",
     "age_spot",
-    "radiance",
-    "redness",
+    # "radiance",
+    # "redness",
     "oiliness",
-    "pore",
-    "texture",
-    "tear_trough",
+    # "pore",
+    # "texture",
+    # "tear_trough",
     "skin_type",
 ]
 
@@ -449,22 +495,25 @@ async def check_skin_analysis_task(analysis_id: str, task_id: str) -> dict:
         _mark_completed(analysis_id, skin_metrics, skin_health_score, recommendations)
         return _get_analysis_record(analysis_id)
     if task_status != "running":
-        _mark_failed(analysis_id, f"Perfect Corp task failed with status '{task_status}'.")
+        # Perfect Corp includes a machine-readable "error" code and a
+        # human-readable "error_message" on failed tasks (e.g.
+        # error_src_face_too_small) — surface those instead of a generic
+        # message so the actual rejection reason isn't lost.
+        detail = data.get("error_message") or data.get("error") or "unknown reason"
+        _mark_failed(analysis_id, f"Perfect Corp task failed ({task_status}): {detail}")
         return _get_analysis_record(analysis_id)
 
     return _get_analysis_record(analysis_id)
 
 
-def compute_skin_health_score(skin_metrics: dict) -> int:
+def compute_skin_health_score(skin_metrics: dict) -> Optional[int]:
     """
-    Convert raw Perfect Corp metrics into a single 0-100 skin health score.
-
-    TODO: implement the actual deterministic weighted-scoring rule set
-    (per the project's decision to use rule-based scoring, not LLM
-    reasoning, for consistency and auditability). Placeholder below.
+    Derive the overall skin health score from Perfect Corp's "all" metric —
+    its general skin condition score (0-100) across all analyzed concerns.
+    Returns None if that entry isn't present in the results for some reason.
     """
-    # Placeholder: replace with real weighted scoring logic.
-    return 75
+    score = _find_metric_score(skin_metrics, "all")
+    return round(score) if score is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -580,14 +629,15 @@ async def get_analysis_result(analysis_id: str):
     recorded, this performs a single status check against Perfect Corp
     (see check_skin_analysis_task) and updates Supabase accordingly —
     the client is expected to call this repeatedly until the status is
-    no longer "pending".
+    no longer "pending". Returns a trimmed view (see _build_analysis_response)
+    rather than the raw Supabase row.
     """
     record = _get_analysis_record(analysis_id)
 
     if record["status"] == "pending" and record.get("task_id"):
         record = await check_skin_analysis_task(analysis_id, record["task_id"])
 
-    return record
+    return _build_analysis_response(record)
 
 
 @app.get("/analyze/{analysis_id}/recommendations")
