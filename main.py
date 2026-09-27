@@ -66,12 +66,14 @@ import io
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from PIL import Image
 from pydantic import BaseModel
@@ -85,14 +87,12 @@ load_dotenv()
 # 1. APP & SHARED RESOURCES (initialized once at startup, reused per request)
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="SkinCode API")
-
 # Supabase client, created once and reused.
 _supabase_client: Optional[Client] = None
 
 
-@app.on_event("startup")
-def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global _supabase_client
 
     supabase_url = os.environ.get("SUPABASE_URL")
@@ -102,6 +102,10 @@ def startup():
             "SUPABASE_URL and SUPABASE_KEY environment variables must be set."
         )
     _supabase_client = create_client(supabase_url, supabase_key)
+    yield
+
+
+app = FastAPI(title="SkinCode API", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +131,13 @@ class AnalysisRejected(BaseModel):
 
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB - Perfect Corp's hard limit
 MIN_IMAGE_DIMENSION_PX = 480             # minimum shortest side for the SD tier
+
+# Ceiling for the whole multipart body, checked against Content-Length before
+# reading anything, so an oversized upload is refused instead of being buffered
+# into memory in full just to fail the per-file check below. The 1 MB of slack
+# covers multipart boundaries and headers, so a legitimately 10 MB photo still
+# reaches validate_image_for_perfect_corp and gets the precise error message.
+MAX_REQUEST_BODY_BYTES = MAX_FILE_SIZE_BYTES + 1024 * 1024
 
 
 class ImageValidationError(Exception):
@@ -185,50 +196,66 @@ def validate_image_for_perfect_corp(image_bytes: bytes) -> dict:
 #     updated_at timestamptz
 #   );
 
-def _create_pending_record(analysis_id: str, image_metadata: dict) -> None:
+# supabase-py's client is synchronous, so every call below goes through
+# run_in_threadpool — calling .execute() directly from an async endpoint
+# would block the event loop for the whole Supabase round-trip, stalling
+# every other in-flight request.
+
+async def _create_pending_record(analysis_id: str, image_metadata: dict) -> None:
     """Insert the initial 'pending' row before the background task starts."""
-    _supabase_client.table("skin_analyses").insert({
-        "id": analysis_id,
-        "status": "pending",
-        "quality_metrics": image_metadata,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    await run_in_threadpool(
+        lambda: _supabase_client.table("skin_analyses").insert({
+            "id": analysis_id,
+            "status": "pending",
+            "quality_metrics": image_metadata,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    )
 
 
-def _mark_task_submitted(analysis_id: str, task_id: str) -> None:
+async def _mark_task_submitted(analysis_id: str, task_id: str) -> None:
     """Record the Perfect Corp task_id once the task has been created; status stays 'pending'."""
-    _supabase_client.table("skin_analyses").update({
-        "task_id": task_id,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", analysis_id).execute()
+    await run_in_threadpool(
+        lambda: _supabase_client.table("skin_analyses").update({
+            "task_id": task_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", analysis_id).execute()
+    )
 
 
-def _mark_completed(
-    analysis_id: str, skin_metrics: dict, skin_health_score: int, recommendations: list
+async def _mark_completed(
+    analysis_id: str,
+    skin_metrics: dict,
+    skin_health_score: Optional[int],
+    recommendations: list,
 ) -> None:
     """Update the record once Perfect Corp analysis succeeds."""
-    _supabase_client.table("skin_analyses").update({
-        "status": "completed",
-        "skin_metrics": skin_metrics,
-        "skin_health_score": skin_health_score,
-        "recommendations": recommendations,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", analysis_id).execute()
+    await run_in_threadpool(
+        lambda: _supabase_client.table("skin_analyses").update({
+            "status": "completed",
+            "skin_metrics": skin_metrics,
+            "skin_health_score": skin_health_score,
+            "recommendations": recommendations,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", analysis_id).execute()
+    )
 
 
-def _mark_failed(analysis_id: str, error_message: str) -> None:
+async def _mark_failed(analysis_id: str, error_message: str) -> None:
     """Update the record if Perfect Corp analysis fails for any reason."""
-    _supabase_client.table("skin_analyses").update({
-        "status": "failed",
-        "error_message": error_message,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", analysis_id).execute()
+    await run_in_threadpool(
+        lambda: _supabase_client.table("skin_analyses").update({
+            "status": "failed",
+            "error_message": error_message,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", analysis_id).execute()
+    )
 
 
-def _get_analysis_record(analysis_id: str) -> dict:
+async def _get_analysis_record(analysis_id: str) -> dict:
     """Fetch a skin_analyses row by id, or raise 404 if it doesn't exist."""
-    result = (
-        _supabase_client.table("skin_analyses")
+    result = await run_in_threadpool(
+        lambda: _supabase_client.table("skin_analyses")
         .select("*")
         .eq("id", analysis_id)
         .execute()
@@ -238,11 +265,11 @@ def _get_analysis_record(analysis_id: str) -> dict:
     return result.data[0]
 
 
-def _find_analysis_by_task_id(task_id: str) -> Optional[dict]:
+async def _find_analysis_by_task_id(task_id: str) -> Optional[dict]:
     """Look up a skin_analyses row by its Perfect Corp task_id (used by the webhook handler,
     which only receives a task_id — not our analysis_id). Returns None if not found."""
-    result = (
-        _supabase_client.table("skin_analyses")
+    result = await run_in_threadpool(
+        lambda: _supabase_client.table("skin_analyses")
         .select("*")
         .eq("task_id", task_id)
         .execute()
@@ -268,7 +295,7 @@ def _summarize_skin_metrics(skin_metrics: Optional[dict]) -> list[dict]:
     return [
         {"type": item["type"], "ui_score": item["ui_score"]}
         for item in skin_metrics.get("output", [])
-        if "ui_score" in item
+        if "ui_score" in item and "type" in item
     ]
 
 
@@ -307,10 +334,10 @@ def _build_analysis_response(record: dict) -> dict:
 #   4. GET  /s2s/v2.0/task/skin-analysis/<task_id> -> check task_status
 #
 # Steps 1-3 happen once, in the background task right after upload
-# (submit_skin_analysis_task). Step 4 is NOT looped internally — Perfect
-# Corp has no webhook/callback, so instead of us polling on a timer,
-# GET /analyze/{analysis_id} performs a single step-4 check each time the
-# client calls it, driven by the client's own polling cadence.
+# (submit_skin_analysis_task). Step 4 is NOT looped internally: it runs once
+# per trigger, either when Perfect Corp's webhook reports the task finished
+# (the primary path) or when a client calls GET /analyze/{analysis_id} (the
+# fallback, driven by the client's own polling cadence).
 #
 # NOTE: response field names below (file_id, requests[].url/method, task_id,
 # task_status, results) are taken from Perfect Corp's published examples but
@@ -484,26 +511,31 @@ async def check_skin_analysis_task(analysis_id: str, task_id: str) -> dict:
         async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
             data = await _fetch_skin_analysis_task(client, api_key, task_id)
     except PerfectCorpError as e:
-        _mark_failed(analysis_id, str(e))
-        return _get_analysis_record(analysis_id)
+        await _mark_failed(analysis_id, str(e))
+        return await _get_analysis_record(analysis_id)
 
     task_status = data.get("task_status")
     if task_status == "success":
-        skin_metrics = data["results"]
+        skin_metrics = data.get("results")
+        if skin_metrics is None:
+            await _mark_failed(
+                analysis_id, "Perfect Corp reported success but returned no results."
+            )
+            return await _get_analysis_record(analysis_id)
         skin_health_score = compute_skin_health_score(skin_metrics)
         recommendations = compute_product_recommendations(skin_metrics, skin_health_score)
-        _mark_completed(analysis_id, skin_metrics, skin_health_score, recommendations)
-        return _get_analysis_record(analysis_id)
+        await _mark_completed(analysis_id, skin_metrics, skin_health_score, recommendations)
+        return await _get_analysis_record(analysis_id)
     if task_status != "running":
         # Perfect Corp includes a machine-readable "error" code and a
         # human-readable "error_message" on failed tasks (e.g.
         # error_src_face_too_small) — surface those instead of a generic
         # message so the actual rejection reason isn't lost.
         detail = data.get("error_message") or data.get("error") or "unknown reason"
-        _mark_failed(analysis_id, f"Perfect Corp task failed ({task_status}): {detail}")
-        return _get_analysis_record(analysis_id)
+        await _mark_failed(analysis_id, f"Perfect Corp task failed ({task_status}): {detail}")
+        return await _get_analysis_record(analysis_id)
 
-    return _get_analysis_record(analysis_id)
+    return await _get_analysis_record(analysis_id)
 
 
 def compute_skin_health_score(skin_metrics: dict) -> Optional[int]:
@@ -558,13 +590,13 @@ async def process_analysis(analysis_id: str, image_bytes: bytes, filename: str, 
     """
     try:
         task_id = await submit_skin_analysis_task(image_bytes, filename, content_type)
-        _mark_task_submitted(analysis_id, task_id)
+        await _mark_task_submitted(analysis_id, task_id)
     except PerfectCorpError as e:
-        _mark_failed(analysis_id, str(e))
+        await _mark_failed(analysis_id, str(e))
     except Exception as e:
         # Catch-all so an unexpected error still leaves a clear failure
         # record instead of leaving the analysis stuck in "pending" forever.
-        _mark_failed(analysis_id, f"Unexpected error: {e}")
+        await _mark_failed(analysis_id, f"Unexpected error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +610,7 @@ async def process_analysis(analysis_id: str, image_bytes: bytes, filename: str, 
     responses={422: {"model": AnalysisRejected}},
 )
 async def analyze_photo(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
@@ -586,6 +619,10 @@ async def analyze_photo(
     requirements, and — if it passes — kick off the Perfect Corp
     analysis in the background.
     """
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_REQUEST_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Request body is too large.")
+
     image_bytes = await file.read()
 
     # --- Stage 1: upload validation (file size + minimum resolution) ---
@@ -600,7 +637,7 @@ async def analyze_photo(
     # --- Stage 2: create the pending record before returning ---
     analysis_id = str(uuid.uuid4())
     try:
-        _create_pending_record(analysis_id, image_metadata)
+        await _create_pending_record(analysis_id, image_metadata)
     except Exception as e:
         # If we can't even create the record, don't schedule a background
         # task that will have nothing to update — fail loudly instead.
@@ -632,7 +669,7 @@ async def get_analysis_result(analysis_id: str):
     no longer "pending". Returns a trimmed view (see _build_analysis_response)
     rather than the raw Supabase row.
     """
-    record = _get_analysis_record(analysis_id)
+    record = await _get_analysis_record(analysis_id)
 
     if record["status"] == "pending" and record.get("task_id"):
         record = await check_skin_analysis_task(analysis_id, record["task_id"])
@@ -649,7 +686,7 @@ async def get_product_recommendations(analysis_id: str):
     stored on the record; this endpoint just reads that stored value,
     computing it on the fly as a fallback for records that predate that.
     """
-    record = _get_analysis_record(analysis_id)
+    record = await _get_analysis_record(analysis_id)
 
     if record["status"] != "completed":
         raise HTTPException(
@@ -678,6 +715,14 @@ async def perfect_corp_webhook(request: Request):
 
     Uses the Standard Webhooks signature scheme (see the svix library) to
     verify the request actually came from Perfect Corp before trusting it.
+
+    Responds 503 when the delivery can't be resolved yet — either the
+    task_id isn't on any record (our background task may not have written
+    it to Supabase before Perfect Corp fired the webhook) or the status
+    check still says "running". Perfect Corp only sends one webhook per
+    task, so answering 200 in those cases would silently drop it and leave
+    the analysis pending until a client happens to poll; a non-2xx makes
+    Standard Webhooks retry with backoff instead.
     """
     body = await request.body()
 
@@ -690,18 +735,32 @@ async def perfect_corp_webhook(request: Request):
     except WebhookVerificationError as e:
         raise HTTPException(status_code=401, detail=f"Invalid webhook signature: {e}") from e
 
-    payload = json.loads(body)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Malformed webhook payload: {e}") from e
+
     task_id = payload.get("data", {}).get("task_id")
     if not task_id:
         raise HTTPException(status_code=400, detail="Missing data.task_id in webhook payload.")
 
-    record = _find_analysis_by_task_id(task_id)
-    if record is not None and record["status"] == "pending":
-        await check_skin_analysis_task(record["id"], task_id)
+    record = await _find_analysis_by_task_id(task_id)
+    if record is None:
+        raise HTTPException(
+            status_code=503, detail="No analysis recorded for this task_id yet."
+        )
 
-    # Always 200 once the signature checks out, even if we didn't find a
-    # matching (still-pending) record — so Perfect Corp doesn't retry
-    # forever over something that isn't a delivery problem on their end.
+    if record["status"] != "pending":
+        # Already resolved, most likely by a client polling GET /analyze/{id}
+        # before this webhook landed. Nothing to do, and no reason to retry.
+        return {"status": "ok"}
+
+    record = await check_skin_analysis_task(record["id"], task_id)
+    if record["status"] == "pending":
+        raise HTTPException(
+            status_code=503, detail="Perfect Corp task is still running."
+        )
+
     return {"status": "ok"}
 
 
