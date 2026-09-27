@@ -1,3 +1,29 @@
 .env
 __pycache__/
 *.pyc
+
+# Test photos fed to the API. Both cases are listed because case-insensitive
+# matching depends on core.ignorecase, which is true on Windows but not on a
+# Linux clone. heic/webp are here because phone cameras default to them.
+image-test/
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.png
+*.PNG
+*.webp
+*.WEBP
+*.heic
+*.HEIC
+*.bmp
+*.BMP
+*.gif
+*.tif
+*.tiff
+
+# Captured output from manual runs. response_example.json stays tracked —
+# it is the reference payload the code is written against, not run output.
+hasil.json
+get_analyze_response.json
+hasil*.json

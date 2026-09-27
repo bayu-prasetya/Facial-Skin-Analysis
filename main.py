@@ -280,8 +280,8 @@ class AnalysisResult(BaseModel):
                     {"type": "all", "ui_score": 78},
                     {"type": "acne", "ui_score": 64},
                     {"type": "oiliness", "ui_score": 71},
-                    {"type": "age_spot", "ui_score": 83},
-                    {"type": "skin_type", "ui_score": 69},
+                    {"type": "pore", "ui_score": 69},
+                    {"type": "moisture", "ui_score": 83},
                 ],
                 "skin_age": 32,
                 "skin_health_score": 78,
@@ -538,22 +538,10 @@ def _build_analysis_response(record: dict) -> dict:
 # versions) must NOT be mixed in here — SD and HD concern params can't be
 # combined in the same request (API returns InvalidParameters if you do).
 PERFECT_CORP_SKIN_ANALYSIS_ACTIONS = [
-    # "wrinkle",
-    # "droopy_upper_eyelid",
-    # "droopy_lower_eyelid",
-    # "firmness",
     "acne",
-    # "moisture",
-    # "eye_bag",
-    # "dark_circle_v2",
-    "age_spot",
-    # "radiance",
-    # "redness",
     "oiliness",
-    # "pore",
-    # "texture",
-    # "tear_trough",
-    "skin_type",
+    "pore",
+    "moisture"
 ]
 
 
