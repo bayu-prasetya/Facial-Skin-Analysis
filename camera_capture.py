@@ -1,11 +1,11 @@
 """
-SkinCode - Camera Capture Prototype
-=====================================
+Skin Analysis - Camera Capture Prototype
+========================================
 Python/OpenCV prototype for the camera capture flow, meant as a reference
 for building the actual client-side implementation (browser JavaScript).
 
 IMPORTANT CONTEXT:
-SkinCode is deployed as an API service for web/mobile browsers. Camera
+Skin Analysis is deployed as an API service for web/mobile browsers. Camera
 capture in production happens on the CLIENT (browser via getUserMedia +
 Canvas), NOT on the server. This file is NOT meant to run in production —
 it exists so you can prototype and test the capture -> upload check ->
@@ -176,7 +176,7 @@ def capture_with_countdown(
         The captured frame (BGR array), or None if the camera dropped
         out during the countdown.
     """
-    window_name = "SkinCode - Camera Preview (prototype)"
+    window_name = "Skin Analysis - Camera Preview (prototype)"
     remaining = config.countdown_seconds
 
     start_time = time.time()

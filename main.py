@@ -1,6 +1,6 @@
 """
-SkinCode - FastAPI Endpoint
-=============================
+Skin Analysis - FastAPI Endpoint
+================================
 Main API endpoint that ties together a lightweight upload validation
 (file size + minimum resolution for Perfect Corp's SD tier), the
 Perfect Corp YouCam AI Skin API call, and persistence to Supabase.
@@ -185,7 +185,7 @@ TAGS_METADATA = [
 ]
 
 app = FastAPI(
-    title="SkinCode API",
+    title="Skin Analysis API",
     description=API_DESCRIPTION,
     version="1.0.0",
     openapi_tags=TAGS_METADATA,
