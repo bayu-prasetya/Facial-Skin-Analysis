@@ -27,3 +27,19 @@ image-test/
 hasil.json
 get_analyze_response.json
 hasil*.json
+.pytest_cache/
+
+# This repository is the production deploy artifact: main.py, the recommendation
+# package and the pinned dependencies. The development side of the project is
+# kept on the developer's machine and deliberately not tracked here, so a clone
+# is exactly what gets deployed and nothing more.
+#
+# What that means in practice: the tests live only locally, so a change to
+# recommendation/rules.py has no safety net in this repository. The reviewed
+# catalog (skincode_treatment_tags.xlsx) and the reasoning behind every clinical
+# parameter are local too. Keep a backup of that directory.
+CLAUDE.md
+test_main.py
+recommendation/README.md
+recommendation_prototype/
+ayuko_response_example.json
