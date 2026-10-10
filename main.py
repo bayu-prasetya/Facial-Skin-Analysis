@@ -46,12 +46,17 @@ URL during local development). Whichever path (webhook or polling) first
 observes the task succeeding computes product recommendations right there
 too and stores them alongside the skin metrics — so by the time the
 client sees status="completed", recommendations are already sitting in
-the record.
+the record. Stored with them is the guardrail block they were derived
+under (recommendation_meta: rules_version, urgency band, consultation
+priority, notes, disclaimer). The treatments on their own stop being
+explainable the moment the rules are recalibrated, and the disclaimer is
+a guardrail that has to reach whoever reads them.
 
 GET /analyze/{analysis_id}/recommendations just reads that stored value
-(computing it on the fly as a fallback for older records). Recommendation
-logic is currently a placeholder — the product data source and matching
-logic are not decided yet.
+(computing it on the fly as a fallback for older records). The scoring
+itself lives in the recommendation package, not here - see its README for
+the catalog it needs from Supabase. Until a catalog version is published
+there, every analysis completes with an empty recommendations list.
 
 Perfect Corp's own API already rejects unsuitable photos (blurry, no
 face, bad pose, etc.) at no cost to us, so a local quality-gate
@@ -70,12 +75,22 @@ it's loaded automatically on startup and is gitignored):
                                            from Perfect Corp's API Console
                                            Webhook Management page
 
+Optional, for the treatment catalog, which lives in the clinic's own
+ayuko-api service (see recommendation/README.md):
+    AYUKO_API_BASE_URL                  default https://ayuko-api.vercel.app;
+                                          POST /api/recommendations is asked for
+                                          the catalog of one analysis
+    AYUKO_API_TIMEOUT                   seconds, default 15
+With ayuko-api unreachable, analyses complete with an empty recommendations
+list - never an error.
+
 Run locally:
     uvicorn main:app --reload
 """
 
 import io
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -92,7 +107,14 @@ from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from svix.webhooks import Webhook, WebhookVerificationError
 
+from recommendation import CONCERN_ORDER, build_recommendations
+
 load_dotenv()
+
+# Named, not configured: the host (uvicorn, Cloud Run) owns handler and level.
+# Everything that used to be handed to the client as an error detail is logged
+# here instead — see the error handling in section 7.
+logger = logging.getLogger("skin_analysis")
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +153,9 @@ Analysis is **asynchronous** — a photo takes several seconds to process, so
 2. Poll `GET /analyze/{analysis_id}` until `status` is no longer `pending`.
    Every ~3 seconds is a reasonable cadence.
 3. On `status: "completed"`, read `skin_metrics`, `skin_age`,
-   `skin_health_score`, and `recommendations` from that same response.
+   `skin_health_score`, `recommendations`, and `recommendation_meta` from that
+   same response. `recommendation_meta.disclaimer` has to be shown wherever the
+   recommendations are.
 
 Step 1 is all-or-nothing: either you get an `analysis_id` and an analysis
 exists, or you get an error and nothing was created. There is no state where
@@ -239,7 +263,50 @@ class QualityMetrics(BaseModel):
 class SkinMetric(BaseModel):
     """One skin concern scored by Perfect Corp."""
     type: str = Field(description='Concern name, e.g. "acne", "oiliness", "age_spot".')
-    ui_score: int = Field(description="Score for display, 0-100. Higher is better.")
+    raw_score: int = Field(
+        description="Measured score, 0-100. Higher is better. This is the "
+                    "measurement the recommendation was computed from, not "
+                    "Perfect Corp's adjusted display value."
+    )
+
+
+class RecommendationMeta(BaseModel):
+    """How the recommendations were produced, and what has to be shown with them.
+
+    The full block is kept in the database; this is the part a caller needs. The
+    engine's own notes and the raw scores it used stay internal — see
+    _summarize_recommendation_meta.
+    """
+    rules_version: Optional[str] = Field(
+        default=None,
+        description=(
+            'Which parameter set produced these recommendations, e.g. "2026-10-v8". '
+            "Recorded per analysis so an older result is still explainable after "
+            "the rules are recalibrated."
+        ),
+    )
+    urgency_band: Optional[str] = Field(
+        default=None,
+        description=(
+            "`maintenance`, `ringan`, `sedang`, or `intensif`, derived from the "
+            "overall skin health score. Null when nothing could be recommended."
+        ),
+    )
+    consultation_priority: Optional[str] = Field(
+        default=None,
+        description="`high` when a doctor should be seen soon, otherwise `normal`.",
+    )
+    needs_clinical_confirmation: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Always true. These are a suggestion read off a photo, never a "
+            "prescription — the final plan is the doctor's."
+        ),
+    )
+    disclaimer: Optional[str] = Field(
+        default=None,
+        description="Must be displayed wherever the recommendations are shown.",
+    )
 
 
 class AnalysisResult(BaseModel):
@@ -262,6 +329,14 @@ class AnalysisResult(BaseModel):
     recommendations: Optional[list[dict]] = Field(
         default=None, description="Recommended products. Null until completed."
     )
+    recommendation_meta: Optional[RecommendationMeta] = Field(
+        default=None,
+        description=(
+            "Which rules produced the recommendations, how urgent they are, and "
+            "the disclaimer to show with them. Null until completed, and on "
+            "analyses recorded before this field existed."
+        ),
+    )
     error_message: Optional[str] = Field(
         default=None, description='Why the analysis failed. Only set when status is "failed".'
     )
@@ -277,15 +352,24 @@ class AnalysisResult(BaseModel):
                     "file_size_bytes": 842113,
                 },
                 "skin_metrics": [
-                    {"type": "all", "ui_score": 78},
-                    {"type": "acne", "ui_score": 64},
-                    {"type": "oiliness", "ui_score": 71},
-                    {"type": "pore", "ui_score": 69},
-                    {"type": "moisture", "ui_score": 83},
+                    {"type": "acne", "raw_score": 58},
+                    {"type": "oiliness", "raw_score": 67},
+                    {"type": "pore", "raw_score": 72},
+                    {"type": "moisture", "raw_score": 80},
                 ],
                 "skin_age": 32,
                 "skin_health_score": 78,
                 "recommendations": [],
+                "recommendation_meta": {
+                    "rules_version": "2026-10-v8",
+                    "urgency_band": None,
+                    "consultation_priority": "normal",
+                    "needs_clinical_confirmation": True,
+                    "disclaimer": (
+                        "Rekomendasi awal berdasarkan foto. Paket final "
+                        "ditentukan dokter saat konsultasi."
+                    ),
+                },
                 "error_message": None,
             }
         }
@@ -296,6 +380,13 @@ class RecommendationsResult(BaseModel):
     """Product recommendations for a completed analysis."""
     analysis_id: str
     recommendations: list[dict]
+    recommendation_meta: Optional[RecommendationMeta] = Field(
+        default=None,
+        description=(
+            "The same block as on GET /analyze/{analysis_id}. Null on analyses "
+            "recorded before it existed."
+        ),
+    )
 
 
 class ErrorDetail(BaseModel):
@@ -318,12 +409,51 @@ class WebhookAck(BaseModel):
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB - Perfect Corp's hard limit
 MIN_IMAGE_DIMENSION_PX = 480             # minimum shortest side for the SD tier
 
-# Ceiling for the whole multipart body, checked against Content-Length before
-# reading anything, so an oversized upload is refused instead of being buffered
-# into memory in full just to fail the per-file check below. The 1 MB of slack
+# Ceiling for the whole multipart body, enforced by the middleware below —
+# before anything is parsed — so an oversized upload is refused instead of being
+# buffered in full just to fail the per-file check below. The 1 MB of slack
 # covers multipart boundaries and headers, so a legitimately 10 MB photo still
 # reaches validate_image_for_perfect_corp and gets the precise error message.
 MAX_REQUEST_BODY_BYTES = MAX_FILE_SIZE_BYTES + 1024 * 1024
+
+# Paths whose body is an upload, and so must be size-capped.
+_BODY_LIMITED_PATHS = {"/analyze"}
+
+
+@app.middleware("http")
+async def limit_upload_body(request: Request, call_next):
+    """Refuse an oversized or unmeasured upload before anything reads it.
+
+    This has to be middleware, not a check inside the endpoint. Declaring
+    `file: UploadFile` makes Starlette parse the multipart body while resolving
+    the endpoint's dependencies — which spools it to a temporary file on disk,
+     1 MB at a time — so by the time endpoint code runs, the bytes have already
+    landed. Middleware runs before routing, which is the last point where the
+    request can still be refused for free.
+
+    A body with no Content-Length (HTTP/1.1 chunked) is refused with 411 rather
+    than waved through. Browsers and every normal HTTP client set the header on
+    a multipart upload; accepting a chunked one would mean accepting an upload
+    of unknown length, which is exactly the case this limit exists to stop.
+    """
+    if request.method == "POST" and request.url.path in _BODY_LIMITED_PATHS:
+        content_length = request.headers.get("content-length")
+        if content_length is None:
+            return JSONResponse(
+                status_code=411,
+                content={"detail": "Content-Length is required for an upload."},
+            )
+        try:
+            declared = int(content_length)
+        except ValueError:
+            return JSONResponse(
+                status_code=400, content={"detail": "Content-Length is not a number."}
+            )
+        if declared > MAX_REQUEST_BODY_BYTES:
+            return JSONResponse(
+                status_code=413, content={"detail": "Request body is too large."}
+            )
+    return await call_next(request)
 
 
 class ImageValidationError(Exception):
@@ -377,6 +507,7 @@ def validate_image_for_perfect_corp(image_bytes: bytes) -> dict:
 #     skin_metrics jsonb,
 #     skin_health_score integer,
 #     recommendations jsonb,
+#     recommendation_meta jsonb,
 #     error_message text,
 #     created_at timestamptz not null default now(),
 #     updated_at timestamptz
@@ -404,37 +535,67 @@ async def _create_pending_record(
     )
 
 
+def _warn_if_no_row(result, analysis_id: str, what: str) -> None:
+    """A Supabase update that matches no row succeeds quietly. That means the
+    analysis silently stays in its old state, so say so."""
+    if not getattr(result, "data", None):
+        logger.warning("Marking analysis %s as %s matched no row.", analysis_id, what)
+
+
 async def _mark_completed(
     analysis_id: str,
     skin_metrics: dict,
     skin_health_score: Optional[int],
     recommendations: list,
+    recommendation_meta: Optional[dict],
 ) -> None:
-    """Update the record once Perfect Corp analysis succeeds."""
-    await run_in_threadpool(
+    """Update the record once Perfect Corp analysis succeeds.
+
+    recommendation_meta is the guardrail block the recommendations were derived
+    under — rules_version above all, but also the urgency band, the consultation
+    priority, the engine's notes and the disclaimer. It is written here because
+    the recommendations alone stop being explainable as soon as the rules are
+    recalibrated: rules_version is the only thing that says which parameters
+    produced this row. None means the recommendation step itself failed, so
+    there is no block to record.
+    """
+    result = await run_in_threadpool(
         lambda: _supabase_client.table("skin_analyses").update({
             "status": "completed",
             "skin_metrics": skin_metrics,
             "skin_health_score": skin_health_score,
             "recommendations": recommendations,
+            "recommendation_meta": recommendation_meta,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", analysis_id).execute()
     )
+    _warn_if_no_row(result, analysis_id, "completed")
 
 
 async def _mark_failed(analysis_id: str, error_message: str) -> None:
     """Update the record if Perfect Corp analysis fails for any reason."""
-    await run_in_threadpool(
+    result = await run_in_threadpool(
         lambda: _supabase_client.table("skin_analyses").update({
             "status": "failed",
             "error_message": error_message,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", analysis_id).execute()
     )
+    _warn_if_no_row(result, analysis_id, "failed")
 
 
 async def _get_analysis_record(analysis_id: str) -> dict:
-    """Fetch a skin_analyses row by id, or raise 404 if it doesn't exist."""
+    """Fetch a skin_analyses row by id, or raise 404 if it doesn't exist.
+
+    The id column is a uuid, so a malformed one is rejected by Postgres rather
+    than simply not matching — which would surface as a 500. The analysis
+    genuinely does not exist, so answer the documented 404 instead.
+    """
+    try:
+        uuid.UUID(analysis_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Analysis not found.") from None
+
     result = await run_in_threadpool(
         lambda: _supabase_client.table("skin_analyses")
         .select("*")
@@ -469,15 +630,58 @@ def _find_metric_score(skin_metrics: dict, metric_type: str) -> Optional[float]:
 
 def _summarize_skin_metrics(skin_metrics: Optional[dict]) -> list[dict]:
     """Reduce Perfect Corp's raw skin_metrics (its full "output" array, with
-    mask_urls, regions, etc.) down to just {type, ui_score} per concern —
-    the full raw payload stays in Supabase, this is only for API responses."""
+    mask_urls, regions, etc.) down to just {type, raw_score} per concern —
+    the full raw payload stays in Supabase, this is only for API responses.
+
+    raw_score, not ui_score. Perfect Corp sends both: ui_score is adjusted
+    upward so results look better to the patient (oiliness raw 67 is shown as
+    75), and the engine deliberately scores on raw_score. Showing one number
+    while deciding on another means the displayed score and the severity it
+    produced cannot be reconciled by anyone looking at them — including the
+    clinic, whose own thresholds are written against ui_score. One number
+    everywhere is the point.
+
+    Rounded for display; the engine keeps the unrounded value, so a score
+    sitting within half a point of a level boundary can read as the next band
+    up. Falling back to ui_score is defensive — Perfect Corp sends raw_score
+    for all four concerns we request — and the engine notes it internally as
+    <concern>_used_ui_score when it happens.
+    """
     if not skin_metrics:
         return []
-    return [
-        {"type": item["type"], "ui_score": item["ui_score"]}
-        for item in skin_metrics.get("output", [])
-        if "ui_score" in item and "type" in item
-    ]
+    out = []
+    for item in skin_metrics.get("output", []):
+        if "type" not in item:
+            continue
+        score = item.get("raw_score", item.get("ui_score"))
+        if score is None:
+            continue
+        out.append({"type": item["type"], "raw_score": round(score)})
+    return out
+
+
+# What a caller is allowed to see of the stored recommendation_meta. The
+# engine's notes and its scores_used stay internal: both are diagnostics. The
+# notes are internal states ("catalog_unavailable", "insufficient_data:acne"),
+# and scores_used duplicates the scores already in skin_metrics — unrounded,
+# which is the only difference.
+_PUBLIC_RECOMMENDATION_META_KEYS = (
+    "rules_version",
+    "urgency_band",
+    "consultation_priority",
+    "needs_clinical_confirmation",
+    "disclaimer",
+)
+
+
+def _summarize_recommendation_meta(meta: Optional[dict]) -> Optional[dict]:
+    """Trim the stored guardrail block down to the fields a caller needs: which
+    rules produced the result, how urgent it is, and the disclaimer that has to
+    travel with it. Same split as skin_metrics — the full block stays in
+    Supabase, this is only for API responses."""
+    if not meta:
+        return None
+    return {key: meta.get(key) for key in _PUBLIC_RECOMMENDATION_META_KEYS}
 
 
 def _extract_skin_age(skin_metrics: Optional[dict]) -> Optional[int]:
@@ -500,6 +704,9 @@ def _build_analysis_response(record: dict) -> dict:
         "skin_age": _extract_skin_age(record.get("skin_metrics")),
         "skin_health_score": record.get("skin_health_score"),
         "recommendations": record.get("recommendations"),
+        "recommendation_meta": _summarize_recommendation_meta(
+            record.get("recommendation_meta")
+        ),
         "error_message": record.get("error_message"),
     }
 
@@ -543,6 +750,16 @@ PERFECT_CORP_SKIN_ANALYSIS_ACTIONS = [
     "pore",
     "moisture"
 ]
+
+# The recommendation engine scores exactly the concerns we asked for here. The
+# two lists are written separately because the order differs (Perfect Corp's is
+# the documented action order, the engine's is its reporting order), so assert
+# the sets agree at import: adding an action on one side only would otherwise
+# mean paying for a concern nobody scores, or scoring one nobody measured.
+assert set(PERFECT_CORP_SKIN_ANALYSIS_ACTIONS) == set(CONCERN_ORDER), (
+    "PERFECT_CORP_SKIN_ANALYSIS_ACTIONS and recommendation.CONCERN_ORDER disagree: "
+    f"{sorted(PERFECT_CORP_SKIN_ANALYSIS_ACTIONS)} vs {sorted(CONCERN_ORDER)}"
+)
 
 
 # Per-call timeout for every Perfect Corp request. Steps 1-3 now run inside
@@ -727,8 +944,25 @@ async def check_skin_analysis_task(analysis_id: str, task_id: str) -> dict:
             )
             return await _get_analysis_record(analysis_id)
         skin_health_score = compute_skin_health_score(skin_metrics)
-        recommendations = compute_product_recommendations(skin_metrics, skin_health_score)
-        await _mark_completed(analysis_id, skin_metrics, skin_health_score, recommendations)
+        # Recommendations are an extra on top of the analysis, so their failure
+        # must not stop the result being recorded. If this raised, the row would
+        # stay "pending" and every later poll would check Perfect Corp again —
+        # burning quota while the result we already paid for is thrown away.
+        try:
+            recommendations, recommendation_meta = await compute_product_recommendations(
+                skin_metrics, skin_health_score
+            )
+        except Exception:
+            logger.exception(
+                "Recommendations failed for analysis %s; completing without them.",
+                analysis_id,
+            )
+            # No block to record either: nothing is known about rules that never
+            # ran, and inventing one would make the row look explainable.
+            recommendations, recommendation_meta = [], None
+        await _mark_completed(
+            analysis_id, skin_metrics, skin_health_score, recommendations, recommendation_meta
+        )
         return await _get_analysis_record(analysis_id)
     if task_status != "running":
         # Perfect Corp includes a machine-readable "error" code and a
@@ -755,21 +989,34 @@ def compute_skin_health_score(skin_metrics: dict) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # 6. PRODUCT RECOMMENDATION
 # ---------------------------------------------------------------------------
-# TODO: this is a placeholder. The actual product data source (a new
-# Supabase table, an external catalog/e-commerce API, etc.) and the
-# matching logic (rule-based mapping from skin concerns -> product
-# categories, or something else) haven't been decided yet.
+# The rules, the scoring and the catalog all live in the recommendation
+# package; this is only the seam between it and the request cycle. See
+# recommendation/README.md for what the catalog source has to supply, and the
+# doc "SkinCode - Desain Sistem Rekomendasi Treatment" for the clinical design.
+#
+# The treatment catalog is not ours: it lives in the clinic's own service
+# (ayuko-api), fetched over HTTP from GET /api/treatments and cached, since it
+# is the same for every patient. A service that cannot be reached leaves the
+# analysis completed with an empty recommendations list and the note
+# "catalog_unavailable" — never a failed analysis.
 
-def compute_product_recommendations(skin_metrics: dict, skin_health_score: Optional[int]) -> list[dict]:
-    """
-    Turn a completed analysis's skin metrics + health score into a list of
-    recommended products.
 
-    TODO: replace with real product matching logic once the product data
-    source is decided. Placeholder below.
+async def compute_product_recommendations(
+    skin_metrics: dict, skin_health_score: Optional[int]
+) -> tuple[list[dict], dict]:
     """
-    # Placeholder: replace with real product matching logic.
-    return []
+    Turn a completed analysis's skin metrics + health score into the list of
+    recommended treatments stored on the record and returned by the API, plus
+    the guardrail block they were derived under (see _mark_completed).
+
+    Scoring itself is pure and synchronous; only the catalog lookup leaves the
+    process, and it is awaited rather than blocking (async httpx).
+
+    The catalog comes from ayuko-api's POST /api/recommendations, which answers
+    for this patient's own concerns. That makes it one call per analysis, and
+    deliberately not cached: a cached answer would be another patient's.
+    """
+    return await build_recommendations(skin_metrics, skin_health_score)
 
 
 # ---------------------------------------------------------------------------
@@ -817,7 +1064,6 @@ def compute_product_recommendations(skin_metrics: dict, skin_health_score: Optio
     },
 )
 async def analyze_photo(
-    request: Request,
     file: UploadFile = File(
         description="Face photo. JPEG or PNG, max 10 MB, min 480px on the shortest side.",
     ),
@@ -829,10 +1075,8 @@ async def analyze_photo(
     Everything here is synchronous so that the task_id is persisted in the
     same request that created it — see the module docstring.
     """
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_REQUEST_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="Request body is too large.")
-
+    # Size is already capped by limit_upload_body, which runs before the body
+    # is parsed at all.
     image_bytes = await file.read()
 
     # --- Stage 1: upload validation (file size + minimum resolution) ---
@@ -852,25 +1096,37 @@ async def analyze_photo(
             file.content_type or "image/jpeg",
         )
     except PerfectCorpTimeout as e:
-        raise HTTPException(status_code=504, detail=str(e)) from e
+        # The vendor's own message can carry its response body; it belongs in
+        # the log, not in a reply to an unauthenticated caller.
+        logger.warning("Perfect Corp timed out during submission: %s", e)
+        raise HTTPException(
+            status_code=504,
+            detail="The analysis provider did not respond in time. Safe to retry.",
+        ) from e
     except PerfectCorpError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        logger.warning("Perfect Corp rejected the submission: %s", e)
+        raise HTTPException(
+            status_code=502,
+            detail="The analysis provider could not accept the photo. Safe to retry.",
+        ) from e
 
     # --- Stage 3: persist the task_id in the same request that created it ---
     analysis_id = str(uuid.uuid4())
     try:
         await _create_pending_record(analysis_id, task_id, image_metadata)
-    except Exception as e:
+    except Exception:
         # The task exists at Perfect Corp but we failed to record its id, so it
-        # can never be read back. Name the orphaned task_id in the error: it's
-        # the only trace left for reconciling against Perfect Corp's usage.
+        # can never be read back. The orphaned task_id is the only trace left
+        # for reconciling against Perfect Corp's usage, so it is logged at
+        # error level — it must not go to the client, which is unauthenticated
+        # and has no use for it.
+        logger.exception(
+            "Analysis task %s was created at Perfect Corp but could not be recorded.",
+            task_id,
+        )
         raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Analysis task {task_id} was created at Perfect Corp but could "
-                f"not be recorded: {e}"
-            ),
-        ) from e
+            status_code=500, detail="The analysis could not be recorded. Safe to retry."
+        )
 
     return AnalysisAccepted(analysis_id=analysis_id)
 
@@ -885,8 +1141,9 @@ async def analyze_photo(
         "`status` is `completed` or `failed` — roughly every 3 seconds.\n\n"
         "While `status` is `pending`, the result fields are `null` or empty. Once "
         "`status` is `completed`, `skin_metrics`, `skin_age`, `skin_health_score`, "
-        "and `recommendations` are all populated. If `status` is `failed`, stop "
-        "polling and read `error_message` — it will not recover.\n\n"
+        "`recommendations`, and `recommendation_meta` are all populated. If "
+        "`status` is `failed`, stop polling and read `error_message` — it "
+        "will not recover.\n\n"
         "Each call may trigger a status check against Perfect Corp, so don't poll "
         "faster than once per second."
     ),
@@ -943,6 +1200,8 @@ async def get_product_recommendations(
     Perfect Corp task succeeding (see check_skin_analysis_task) — and
     stored on the record; this endpoint just reads that stored value,
     computing it on the fly as a fallback for records that predate that.
+    recommendation_meta comes along because the disclaimer in it has to be
+    shown wherever the recommendations are, including here.
     """
     record = await _get_analysis_record(analysis_id)
 
@@ -953,12 +1212,17 @@ async def get_product_recommendations(
         )
 
     recommendations = record.get("recommendations")
+    recommendation_meta = record.get("recommendation_meta")
     if recommendations is None:
-        recommendations = compute_product_recommendations(
+        recommendations, recommendation_meta = await compute_product_recommendations(
             record.get("skin_metrics") or {}, record.get("skin_health_score")
         )
 
-    return {"analysis_id": analysis_id, "recommendations": recommendations}
+    return {
+        "analysis_id": analysis_id,
+        "recommendations": recommendations,
+        "recommendation_meta": _summarize_recommendation_meta(recommendation_meta),
+    }
 
 
 @app.post(

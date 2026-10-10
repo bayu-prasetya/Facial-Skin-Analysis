@@ -6,3 +6,7 @@ supabase==2.31.0
 Pillow==12.2.0
 python-dotenv==1.2.2
 svix==2.5.0
+# Pinned explicitly although FastAPI pulls it in: every request and response
+# model in main.py is a pydantic model, so a minor release of it can change the
+# API's validation behaviour with nothing in this repo having changed.
+pydantic==2.13.4
