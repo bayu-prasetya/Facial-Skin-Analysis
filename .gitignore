@@ -43,3 +43,14 @@ test_main.py
 recommendation/README.md
 recommendation_prototype/
 ayuko_response_example.json
+
+# Untracked in the same spirit, but these were tracked before and had to be
+# removed from the index to leave: a local webcam prototype that its own
+# docstring says is never deployed, the reference payload the vendor code was
+# written against, and editor settings. The files stay on disk.
+#
+# Removing response_example.json does not erase it: earlier commits still carry
+# it, and with it the Perfect Corp S3 account paths inside.
+camera_capture.py
+response_example.json
+.vscode/
