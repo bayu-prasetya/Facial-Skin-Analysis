@@ -1276,8 +1276,15 @@ async def perfect_corp_webhook(request: Request):
 
     try:
         Webhook(webhook_secret).verify(body, dict(request.headers))
-    except WebhookVerificationError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid webhook signature: {e}") from e
+    except (WebhookVerificationError, ValueError) as e:
+        # ValueError as well as the library's own error: a signature header that
+        # is not decodable base64 ("v1,x", or a value with no version prefix)
+        # reaches binascii.b64decode inside standardwebhooks and raises
+        # binascii.Error, a ValueError subclass. Catching only
+        # WebhookVerificationError let those two shapes out as a 500 with a
+        # stack trace on a path documented — and relied on — as 401.
+        logger.warning("Webhook signature verification failed: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid webhook signature.") from e
 
     try:
         payload = json.loads(body)
