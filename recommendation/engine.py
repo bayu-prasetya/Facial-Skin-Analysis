@@ -11,6 +11,7 @@ Treatment", tab "Alur rekomendasi lengkap"):
     2. derive_signals()      raw_score -> level S1-S4, need 0-1, proxy needs, urgency band
     4. rank_treatments()     eligibility gates, then relevance 0-100 per treatment
     5. related_options() / pick_addons()
+    5b. fill_to_minimum()   at least three, topped up from the lowest scores
     6. apply_guardrails()    disclaimer, consultation priority, medical flags
 
 Stage 3 (picking a curated package) is deliberately absent in rules 2026-10-v8.
@@ -24,7 +25,15 @@ Coverage alone would let an oil-control treatment score high on skin that is not
 oily, as long as one minor benefit matched; precision alone would reward narrow
 treatments regardless of how little of the face they help. Proxy needs (R1-R3)
 count in coverage's numerator only — they are estimates, so they must never
-dilute a treatment that addresses something the photo actually measured.
+dilute a treatment that addresses something the photo actually measured. And
+since v10 a proxy and the measured concern it was inferred from are counted
+once for a treatment tagged with both (the larger credit): the proxy is a
+fraction of that same measurement, not a second one.
+
+Nothing is counted twice anywhere else either: severity specificity is in the
+shown score (severity_fit) and therefore not in the tie-break, and R5 is in the
+tie-break and therefore not in the score — most OIL-coded treatments already
+earn oil credit through an oiliness tag.
 """
 from __future__ import annotations
 
@@ -98,6 +107,30 @@ def at_least(lvl: Optional[str], minimum: str) -> bool:
     return lvl is not None and LEVEL_ORDER[lvl] >= LEVEL_ORDER[minimum]
 
 
+def health_for_band(raw: dict, measured: list, vendor_health: Optional[float]) -> float:
+    """The overall-health number the urgency band is read from.
+
+    Perfect Corp's own overall score (`all`, stored as skin_health_score) is the
+    mean of the four ui_scores — exactly, on every analysis we hold — so it sits
+    on the inflated display scale while everything else here is raw. On the
+    worst face we have (raw pore 17) the two disagree by 20 points: ui mean 66.8
+    reads as "sedang", raw mean 47.0 as "intensif" with consultation priority
+    high. `health_source = "raw_mean"` bands on the measurement; `"vendor_all"`
+    keeps the vendor's number, which is what v9 did.
+
+    main.compute_skin_health_score calls this too, so the skin_health_score a
+    client receives is the same number the band was read from, under whichever
+    rules version is active.
+    """
+    source = RECOMMENDATION_RULES["health_source"]
+    if source == "raw_mean":
+        values = [raw[c] for c in measured if raw.get(c) is not None]
+        if values:
+            return sum(values) / len(values)
+        return vendor_health if vendor_health is not None else 0
+    return vendor_health if vendor_health is not None else 0
+
+
 def derive_signals(raw: dict, skin_health_score: Optional[float], catalog: Catalog) -> dict:
     """Turn raw scores into the levels, needs and bands the later stages read."""
     R, rk = RECOMMENDATION_RULES, RECOMMENDATION_RULES["ranking"]
@@ -113,7 +146,7 @@ def derive_signals(raw: dict, skin_health_score: Optional[float], catalog: Catal
     # they are alternative evidence for one condition, not separate conditions
     # to be added up. `lv` only holds measured concerns, so a source that is
     # itself inferred never qualifies and proxies cannot chain.
-    active_proxies = {}
+    active_proxies, proxy_sources = {}, {}
     for rule_id, concern, source, min_level, factor in R["proxy_rules"]:
         if concern in measured or not at_least(lv.get(source), min_level):
             continue
@@ -122,8 +155,9 @@ def derive_signals(raw: dict, skin_health_score: Optional[float], catalog: Catal
             continue
         need[concern] = inferred
         active_proxies[concern] = rule_id
+        proxy_sources[concern] = source
 
-    health = skin_health_score if skin_health_score is not None else 0
+    health = health_for_band(raw, measured, skin_health_score)
     band = next(b for b in R["urgency_bands"] if health >= b[0])
     return {
         "raw": raw,
@@ -131,8 +165,10 @@ def derive_signals(raw: dict, skin_health_score: Optional[float], catalog: Catal
         "need": need,
         "measured": measured,
         "active_proxies": active_proxies,
+        "proxy_sources": proxy_sources,
         "acne_level": lv.get("acne"),
         "r5_oil_and_pore": bool(lv.get("pore") and lv.get("oiliness")),
+        "health_for_band": round(health, 2),
         "band": band[1],
         "max_addons": band[2],
         "consultation_priority": band[3],
@@ -149,35 +185,54 @@ def _hide_invasive(sig: dict) -> bool:
     return R["always_hide_invasive"] or at_least(sig["acne_level"], R["invasive_hidden_from"])
 
 
-def score_treatment(t, sig: dict) -> Optional[dict]:
-    """Relevance 0-100, or None when the treatment is not eligible for this user.
+def passes_gates(t, sig: dict) -> bool:
+    """The five eligibility gates from the design doc. Failing any one hides the
+    treatment entirely, whatever it would have scored.
 
-    The five gates below are the ones in the design doc; failing any one hides
-    the treatment entirely, whatever it would have scored.
+    Kept apart from the score so that a pick made without one — care for skin
+    that measured perfect, where every need is zero — is held to exactly the
+    same gates rather than to a second copy of them.
     """
-    rk = RECOMMENDATION_RULES["ranking"]
-
     # 1. Is the benefit visible in the photo at all?
     if t.status not in ("Langsung", "Sebagian", "Proxy"):
-        return None
+        return False
     # 2. Is it safe for this user's acne right now? (R4)
     if t.is_invasive and _hide_invasive(sig):
-        return None
+        return False
     # 3. Does it match this user's acne level?
     if t.severity is not None and (sig["acne_level"] is None or sig["acne_level"] not in t.severity):
-        return None
+        return False
     # 4. Is the user actually acne-affected, for an acne-purpose treatment?
     if "acne" in t.needed and sig["acne_level"] is None:
-        return None
+        return False
     # 5. For a proxy treatment: is its rule active?
-    is_proxy = t.status == "Proxy"
-    if is_proxy and not any(c in sig["active_proxies"] for c in t.needed):
+    if t.status == "Proxy" and not any(c in sig["active_proxies"] for c in t.needed):
+        return False
+    return True
+
+
+def score_treatment(t, sig: dict) -> Optional[dict]:
+    """Relevance 0-100, or None when the treatment is not eligible for this user."""
+    rk = RECOMMENDATION_RULES["ranking"]
+    if not passes_gates(t, sig):
         return None
+    is_proxy = t.status == "Proxy"
 
     w, need, proxies = rk["concern_weight"], sig["need"], sig["active_proxies"]
     affinity = {c: rk["affinity_secondary"] for c in t.secondary}
     affinity.update({c: rk["affinity_needed"] for c in t.needed})
     contrib = {c: w.get(c, 0) * need[c] * affinity.get(c, 0) for c in need}
+
+    # A proxy need is a fraction of its source's need, so a treatment tagged
+    # with both would be credited twice for one measurement — TCA Cross reached
+    # 83 on a face whose only finding was pores, against 50 for the pore credit
+    # alone. Counted once, the larger: the same rule two sources of one proxy
+    # already follow (see derive_signals).
+    if rk["proxy_source_counted_once"]:
+        for concern, source in sig.get("proxy_sources", {}).items():
+            if contrib.get(concern) and contrib.get(source):
+                lower = concern if contrib[concern] < contrib[source] else source
+                contrib[lower] = 0.0
 
     # Coverage — proxy needs add to the numerator only (see the module docstring).
     total = sum(w.get(c, 0) * need[c] for c in need if c not in proxies)
@@ -222,6 +277,63 @@ def _addresses_oil_secondarily(t) -> bool:
     return bool(secondary_marker) and secondary_marker in t.secondary
 
 
+def recommendation_score(t, relevance: int, sig: dict) -> int:
+    """The number shown: relevance, nudged down by at most `cap` by two factors.
+
+        score = relevance x ((1 - cap) + cap x F),   F = weighted mean of factors
+
+    Relevance is what the photo says this treatment does for this face. Exact
+    ties in it are the normal case — treatments with the same tag profile score
+    the same to the decimal, and 35% of multi-finding results showed every
+    treatment at one number. F separates them with two things relevance does
+    not see:
+
+      severity_fit  how specific the treatment is to the patient's acne level.
+                    Gate 3 already requires the level to be inside the range;
+                    a range of one level fits better than one spanning all four.
+                    Neutral when the patient has no acne or the treatment no range.
+      package       a sales factor: the clinic's bundles exist to sell the
+                    treatments in them, and the front end recommends packages
+                    alongside, so a treatment in a large package leads to more of
+                    the catalog. In no package scores 0; in one, a base plus a
+                    share for its size. Neutral when the package data is missing.
+
+    Bounded so it can only reorder near-ties: a relevance gap larger than `cap`
+    is never overturned. It never raises a score, so nothing passes 100. The
+    label is still read from relevance alone — a bundle may move a number, but
+    not whether a treatment is "Relevan" — and so is every eligibility test.
+    With floor_at_label (v10) the number is also held inside that label's band,
+    so the two never contradict each other.
+    """
+    M = RECOMMENDATION_RULES["ranking"]["score_modifier"]
+    if not M["cap"]:
+        return relevance
+
+    factors = {}
+    if sig["acne_level"] and t.severity:
+        factors["severity_fit"] = M["severity_fit"].get(len(t.severity), min(M["severity_fit"].values()))
+    else:
+        factors["severity_fit"] = M["neutral"]
+    if t.package_size is None:
+        factors["package"] = M["neutral"]
+    elif t.package_size == 0:
+        factors["package"] = 0.0
+    else:
+        base = M["package_member_base"]
+        factors["package"] = base + (1 - base) * min(1.0, t.package_size / M["package_size_full"])
+
+    weights = M["weights"]
+    total = sum(weights.values())
+    blend = sum(weights[k] * factors[k] for k in weights) / total if total else M["neutral"]
+    shown = round(relevance * ((1 - M["cap"]) + M["cap"] * blend))
+    # The label is read from relevance, so without this a relevance of 31 could
+    # be shown as "29 · Pendukung" — a number below the band its own label
+    # names. Held at the band's lower edge, the modifier still orders within it.
+    if M["floor_at_label"]:
+        shown = max(shown, label_floor(relevance))
+    return shown
+
+
 def rank_treatments(sig: dict, catalog: Catalog) -> tuple[list, list]:
     """Return (the ranked list shown to the user, every scored treatment)."""
     rk = RECOMMENDATION_RULES["ranking"]
@@ -230,12 +342,14 @@ def rank_treatments(sig: dict, catalog: Catalog) -> tuple[list, list]:
         s = score_treatment(t, sig)
         if s is None:
             continue
-        s["_r5"] = sig["r5_oil_and_pore"] and _addresses_oil_secondarily(t)
-        s["_spec"] = len(t.severity) if t.severity else 9
-        s["_price"] = t.price if t.price is not None else float("inf")
+        s["relevance"] = s["score"]
+        s["score"] = recommendation_score(t, s["relevance"], sig)
         scored.append(s)
-    # Ties: R5 (oil + pore both affected -> AC_*_OIL first) -> narrowest
-    # severity range (more specific to this level) -> lowest price -> id.
+    # Ties, in the order `tie_break` names: R5 (oil + pore both affected ->
+    # AC_*_OIL first) -> narrowest severity range (more specific to this
+    # level; v9 only — from v10 that is already in the score through
+    # severity_fit, and counting it here too would count it twice) -> lowest
+    # price -> id.
     #
     # Price is the tie-break because exact ties are common and the catalog
     # gives nothing else to separate them: the ten scar treatments all carry
@@ -255,12 +369,24 @@ def rank_treatments(sig: dict, catalog: Catalog) -> tuple[list, list]:
     #
     # A treatment with no price sorts last rather than first, so a missing
     # field never promotes a treatment over one whose price is known.
-    scored.sort(key=lambda s: (-s["score"], not s["_r5"], s["_spec"], s["_price"], s["t"].id))
+    keys = {
+        "r5": lambda s: not (sig["r5_oil_and_pore"] and _addresses_oil_secondarily(s["t"])),
+        "severity_width": lambda s: len(s["t"].severity) if s["t"].severity else 9,
+        "price": lambda s: s["t"].price if s["t"].price is not None else float("inf"),
+        "id": lambda s: s["t"].id,
+    }
+    order = [keys[k] for k in rk["tie_break"]]
+    scored.sort(key=lambda s: (-s["score"], *(k(s) for k in order)))
 
     top, per_golongan = [], {}
     for s in (s for s in scored if not s["proxy_rules"]):
-        if s["score"] < rk["min_score"] or len(top) == rk["top_n"]:
+        if len(top) == rk["top_n"]:
             break
+        # Eligibility is relevance, not the shown score: the modifier orders
+        # near-ties, it does not decide what is relevant enough to show. The
+        # list is sorted by the shown score, so this skips rather than stops.
+        if s["relevance"] < rk["min_score"]:
+            continue
         golongan = s["t"].golongan
         # Without a cap the list fills up with near-identical skin boosters.
         if per_golongan.get(golongan, 0) >= rk["max_per_golongan"]:
@@ -276,7 +402,7 @@ def related_options(scored: list, sig: dict) -> list:
     rk = RECOMMENDATION_RULES["ranking"]
     out = []
     for rule_id in sorted(set(sig["active_proxies"].values())):
-        picks = [s for s in scored if rule_id in s["proxy_rules"] and s["score"] >= rk["min_score"]]
+        picks = [s for s in scored if rule_id in s["proxy_rules"] and s["relevance"] >= rk["proxy_min_score"]]
         out.extend((rule_id, s) for s in picks[: rk["proxy_options_per_rule"]])
     return out
 
@@ -307,11 +433,129 @@ def pick_addons(scored: list, sig: dict, top: list) -> list:
         if len(out) >= sig["max_addons"]:
             break
         if (s["t"].golongan == rk["addon_golongan"] and not s["proxy_rules"]
-                and not s["t"].is_invasive and s["score"] >= rk["addon_min_score"]
+                and not s["t"].is_invasive and s["relevance"] >= rk["addon_min_score"]
                 and s["t"].id not in already_ranked):
             out.append({"treatment_id": s["t"].id, "name": s["t"].name, "score": s["score"],
                         "reason": "Treatment tambahan dengan skor tertinggi"})
     return out
+
+
+def fill_to_minimum(top: list, sig: dict, catalog: Catalog) -> tuple[list, list]:
+    """Top the ranking up to the minimum, from the concerns that score lowest.
+
+    Returns (the ranking, the concerns the added picks were taken for).
+
+    Need is measured against the "no problem" line (80), so above it every
+    concern needs nothing: healthy skin produced an empty list, and a face with
+    a single problem got as many treatments as that one concern has — two, for
+    pore or oiliness alone. Neither is a useful answer to a patient who asked.
+
+    The fill re-measures need against a perfect score instead, so 82 still
+    counts for more than 95, and takes the lowest_concerns concerns that score
+    lowest. It picks round-robin — the best treatment for the lowest concern,
+    then the next concern, and round again — so three picks cover three
+    concerns rather than three variants for one. Within a concern, the order
+    is the ranking's own: score, then price, then id.
+
+    Everything the ranking guards stays guarded. The five gates run as usual
+    (acne-purpose treatments stay out when there is no acne), the golongan cap
+    still holds, and nothing already ranked is picked twice. Proxy treatments
+    never fill: an inference about a condition the photo cannot see is not
+    maintenance. Each pick carries the maintenance label instead of a
+    relevance one, so skin with no problem never reads as "Sangat relevan".
+
+    A care pick carries no score. Its number would be measured against a
+    perfect face rather than against the "no problem" line, so it is not the
+    same quantity as a finding's relevance — showing both as percentages side
+    by side would invite comparing them. The label says what it is.
+
+    When even that finds nothing — every measured concern at a perfect 100, so
+    every need is zero against 100 as well — the picks come from the
+    care_focus_concerns instead: treatments whose primary purpose is general
+    upkeep (radiance, in this catalog), held to the same five gates, cheapest
+    first, one per measured concern they also serve before any repeats.
+    """
+    M = RECOMMENDATION_RULES["maintenance"]
+    rk = RECOMMENDATION_RULES["ranking"]
+    if len(top) >= M["min_treatments"]:
+        return top, []
+
+    perfect = M["perfect_score"]
+    lowest = sorted(sig["measured"], key=lambda c: sig["raw"][c])[: M["lowest_concerns"]]
+    care_sig = dict(sig, active_proxies={}, proxy_sources={},
+                    need={c: max(0.0, (perfect - sig["raw"][c]) / perfect)
+                          for c in sig["measured"]})
+
+    taken = {s["t"].id for s in top}
+    per_golongan: dict = {}
+    for s in top:
+        per_golongan[s["t"].golongan] = per_golongan.get(s["t"].golongan, 0) + 1
+
+    pool = []
+    for t in catalog.treatments.values():
+        if t.id in taken:
+            continue
+        s = score_treatment(t, care_sig)
+        if s is None or s["proxy_rules"]:
+            continue
+        s["_price"] = t.price if t.price is not None else float("inf")
+        pool.append(s)
+    pool.sort(key=lambda s: (-s["score"], s["_price"], s["t"].id))
+
+    filled, used_for = list(top), []
+    while len(filled) < M["min_treatments"]:
+        progressed = False
+        for concern in lowest:
+            if len(filled) >= M["min_treatments"]:
+                break
+            pick = next((s for s in pool
+                         if concern in s["t"].needed
+                         and s["t"].id not in taken
+                         and per_golongan.get(s["t"].golongan, 0) < rk["max_per_golongan"]),
+                        None)
+            if pick is None:
+                continue
+            pick["label"] = M["label"]
+            pick["maintenance"] = True
+            filled.append(pick)
+            taken.add(pick["t"].id)
+            per_golongan[pick["t"].golongan] = per_golongan.get(pick["t"].golongan, 0) + 1
+            if concern not in used_for:
+                used_for.append(concern)
+            progressed = True
+        if not progressed:
+            break
+
+    if len(filled) < M["min_treatments"] and M["care_focus_concerns"]:
+        focus = set(M["care_focus_concerns"])
+        upkeep = sorted(
+            (t for t in catalog.treatments.values()
+             if t.id not in taken and t.needed & focus and t.status != "Proxy"
+             and passes_gates(t, care_sig)),
+            key=lambda t: (t.price if t.price is not None else float("inf"), t.id))
+        for concern in lowest + [None]:   # one per measured concern, then anything left
+            for t in upkeep:
+                if len(filled) >= M["min_treatments"]:
+                    break
+                if t.id in taken or (concern is not None and concern not in t.needed):
+                    continue
+                if per_golongan.get(t.golongan, 0) >= rk["max_per_golongan"]:
+                    continue
+                filled.append({"t": t, "score": None, "label": M["label"], "maintenance": True,
+                               "concerns": sorted(t.needed & focus), "proxy_rules": []})
+                taken.add(t.id)
+                per_golongan[t.golongan] = per_golongan.get(t.golongan, 0) + 1
+                for c in sorted(t.needed & focus):
+                    if c not in used_for:
+                        used_for.append(c)
+                if concern is not None:
+                    break                  # one per concern in this round
+
+    # Fewer than the minimum after all of this is the honest answer: nothing
+    # left is eligible. Care picks never carry a relevance number.
+    for s in filled[len(top):]:
+        s["score"] = None
+    return filled, used_for
 
 
 def label_for(score: Optional[float]) -> Optional[str]:
@@ -319,6 +563,11 @@ def label_for(score: Optional[float]) -> Optional[str]:
     if score is None:
         return None
     return next((name for cutoff, name in RECOMMENDATION_RULES["ranking"]["labels"] if score >= cutoff), None)
+
+
+def label_floor(relevance: float) -> int:
+    """The lower edge of the label band `relevance` falls in; 0 below the last."""
+    return next((cutoff for cutoff, _ in RECOMMENDATION_RULES["ranking"]["labels"] if relevance >= cutoff), 0)
 
 
 # ---------------------------------------------------------------------------
@@ -343,13 +592,16 @@ def apply_guardrails(top: list, options: list, addons: list, sig: dict, catalog:
     return {
         "rules_version": R["version"],
         "urgency_band": sig["band"],
+        "health_for_band": sig["health_for_band"],
         "needs_clinical_confirmation": True,
         "consultation_priority": priority,
         "levels": sig["level"],
         "active_proxy_rules": sorted(set(sig["active_proxies"].values())),
         "ranked_treatments": [
             {"rank": i + 1, "treatment_id": s["t"].id, "name": s["t"].name,
-             "golongan": s["t"].golongan, "score": s["score"], "label": label_for(s["score"]),
+             "golongan": s["t"].golongan, "score": s["score"],
+             "relevance": s.get("relevance", s["score"]),
+             "label": s.get("label") or label_for(s.get("relevance", s["score"])),
              "concerns": s["concerns"], "status": s["t"].status,
              **({"medical_procedure": True} if s["t"].is_invasive else {})}
             for i, s in enumerate(top)
@@ -402,8 +654,20 @@ def recommend(raw: dict, skin_health_score: Optional[float], catalog: Catalog) -
 
     sig = derive_signals(raw, skin_health_score, catalog)
     top, scored = rank_treatments(sig, catalog)
+    top, care_for = fill_to_minimum(top, sig, catalog)
     result = apply_guardrails(top, related_options(scored, sig),
                               pick_addons(scored, sig, top), sig, catalog)
+    if care_for:
+        M = RECOMMENDATION_RULES["maintenance"]
+        measured = [c for c in care_for if c not in M["care_focus_concerns"]]
+        if measured:
+            result["notes"].append(
+                f"{M['label']}: dilengkapi untuk concern dengan skor terendah "
+                f"({', '.join(measured)}), bukan masalah yang terdeteksi")
+        else:
+            result["notes"].append(
+                f"{M['label']}: semua concern terukur sempurna, dipilih treatment "
+                f"perawatan umum, bukan masalah yang terdeteksi")
     result["skin_health_score"] = skin_health_score
     return result
 
@@ -465,6 +729,15 @@ def to_recommendation_meta(result: dict) -> dict:
 
     skin_health_score is left out — it has a column of its own, and two copies
     of one number can disagree.
+
+    `relevance` keeps, per ranked treatment, the number the shown score was
+    derived from. From v10 they differ (the score modifier), and the label, the
+    min_score cut and every eligibility test read relevance — without it a
+    stored result cannot be audited against its own label. Internal: main.py
+    does not return it, for the same reason scores_used is not returned.
     """
-    return {key: value for key, value in result.items()
+    meta = {key: value for key, value in result.items()
             if key not in ("ranked_treatments", "skin_health_score")}
+    meta["relevance"] = {item["treatment_id"]: item.get("relevance", item["score"])
+                         for item in result.get("ranked_treatments", [])}
+    return meta

@@ -37,6 +37,7 @@ from .catalog import (
 from .engine import (
     compute_recommendations,
     extract_raw_scores,
+    health_for_band,
     recommend,
     skin_health_from_metrics,
     to_recommendation_list,
@@ -58,6 +59,7 @@ __all__ = [
     "catalog_from_rows",
     "compute_recommendations",
     "extract_raw_scores",
+    "health_for_band",
     "recommend",
     "skin_health_from_metrics",
     "to_recommendation_list",

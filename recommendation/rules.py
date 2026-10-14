@@ -1,119 +1,108 @@
 """
-Tunable parameters of the recommendation engine.
+Which version of the recommendation rules is in force.
 
-Every number the engine uses lives in this one dict. Changing a value here is a
-change in clinical behaviour, so bump "version" whenever one moves: the version
-is stored on each analysis as rules_version, which is the only way an old
-recommendation can still be explained after the parameters are recalibrated.
+Every number the engine uses lives in one dict, `RECOMMENDATION_RULES`. Each
+released version of that dict is its own module in `rule_versions/`; this
+module picks one and exposes it under the same name the engine has always
+imported, so nothing that reads the rules has to know they are versioned.
 
-Design reference: the doc "SkinCode — Desain Sistem Rekomendasi Treatment",
-tab "Alur rekomendasi lengkap". Each entry below names the stage it belongs to.
+    RULES_VERSION=2026-10-v9   uvicorn main:app      # roll the rules back
+    (unset)                                          # the latest version
 
-Changes in 2026-10-v9: R4 now starts at S4 instead of S3, so injections,
-infusions and subcision are listed for S3 acne. An add-on can no longer be a
-treatment that is already in the ranking — v7 excluded the chosen package's own
-treatments and nothing replaced that when stage 3 went away in v8. Proxy rules
-now name their source concern instead of always reading acne, and R3 (scarring)
-gained pore as a second source so that a patient whose acne has resolved can
-still be offered scar treatment. Equal scores are broken by price, cheapest
-first, instead of alphabetically by treatment_id, and proxy_options_per_rule
-went from 2 to 3.
+The variable is read once, at import — changing it takes a restart, not a code
+deploy. That is the point of keeping rules apart from code: a recalibration that
+turns out wrong can be taken back without also taking back the unrelated fixes
+shipped alongside it.
 
-Changes from 2026-10-v7: package selection (stage 3) is removed. The engine no
-longer picks a curated package, so the in-package ranking tie-break and the
-"not already in the package" add-on condition are gone too, which can reorder
-treatments that score the same.
+Startup refuses to proceed rather than guess:
+  * RULES_VERSION names a version that does not exist;
+  * a module's `version` does not match its file name;
+  * two modules disagree on their keys. The engine reads every key on every
+    request, so an older module missing a key added later would fail mid-request
+    — and a key that is present but switched off is exactly how an older version
+    turns off behaviour that came after it.
 
-`default_levels` carries more weight than its size suggests. The clinic's API
-rejects raw scores (422) and only accepts a severity we derived, so these
-cut-offs are the contract between the two systems: change them and the
-recommendations change, without anything on their side moving.
+The version is stored on each analysis as rules_version, which is the only way
+an old recommendation can still be explained after the rules move on — and why a
+version is never edited once an analysis has been stored under it. See
+`rule_versions/__init__.py` for the conventions.
 """
+import importlib
+import os
+import pkgutil
+import re
 
-RECOMMENDATION_RULES = {
-    "version": "2026-10-v9",
+from . import rule_versions
 
-    # --- Stage 2: level and need ------------------------------------------
-    # Fallback S1-S4 ranges on raw_score (higher = healthier) while the
-    # calibrated ranges in concern_levels are empty. (level, min_inclusive).
-    "default_levels": [("S1", 65), ("S2", 50), ("S3", 35), ("S4", 0)],
-    "no_problem_min": 80,
+_VERSION_PATTERN = re.compile(r"^(\d{4})-(\d{2})-v(\d+)$")
 
-    # (min health score, band, max_addons, consultation_priority)
-    "urgency_bands": [
-        (85, "maintenance", 1, "normal"),
-        (70, "ringan", 1, "normal"),
-        (50, "sedang", 1, "normal"),
-        (0, "intensif", 0, "high"),
-    ],
 
-    # Proxy rules: conditions the photo does not measure, inferred from one it
-    # does. (rule_id, inferred concern, source concern, min source level, factor)
-    # Proxy need = factor x the SOURCE concern's need, and only while the
-    # inferred concern is itself unmeasured. The factor is below 1.0 on purpose:
-    # this is an estimate, not a detection.
-    #
-    # R1 and R2 are post-acne sequelae — post-inflammatory erythema and
-    # hyperpigmentation — so acne is their source by definition.
-    #
-    # R3 is scarring, and scarring outlives the acne that caused it. Sourced
-    # from acne alone it reached nobody whose acne had resolved, which is
-    # exactly the patient who comes in for subsisi: ten treatments including all
-    # four subsisi tiers were unreachable at acne 85. Pore is the only measured
-    # concern that carries textural irregularity, so it is R3's second source.
-    # Same rule id on purpose: one inferred concern, one label, two triggers.
-    #
-    # A rule's source must be a MEASURED concern — an inferred one is never a
-    # source, so proxies cannot chain and infer from each other.
-    "proxy_rules": [
-        ("R1", "redness", "acne", "S2", 0.5),
-        ("R2", "pigmentation", "acne", "S2", 0.5),
-        ("R3", "texture", "acne", "S3", 0.5),
-        ("R3", "texture", "pore", "S2", 0.5),
-    ],
+def _sort_key(version: str) -> tuple:
+    """2026-10-v10 sorts after 2026-10-v9: compared as numbers, not strings."""
+    match = _VERSION_PATTERN.match(version)
+    if not match:
+        raise RuntimeError(f"Rules version {version!r} is not in the form YYYY-MM-vN.")
+    return tuple(int(part) for part in match.groups())
 
-    # R4: from this acne level up, injections/infusions/subcision are never
-    # listed, and consultation priority is forced to high.
-    # Moved S3 -> S4 in v9: at S3 the clinic does want these offered. Note that
-    # this one cut-off still drives both halves of R4, so consultation priority
-    # is no longer forced high at S3 either — the urgency band decides there.
-    "invasive_hidden_from": "S4",
-    "invasive_golongan": ["Injeksi", "Infus", "Subsisi"],
-    "always_hide_invasive": False,  # True = hide them at every level
 
-    # --- Stages 4 and 5: relevance score, ranking, add-ons ----------------
-    "ranking": {
-        "need_threshold": 80,  # need_c = max(0, (80 - raw_c) / 80)
-        "concern_weight": {
-            "acne": 1.0, "oiliness": 0.6, "pore": 0.6, "moisture": 0.5, "radiance": 0.3,
-            "redness": 0.4, "pigmentation": 0.4, "texture": 0.4, "wrinkle": 0.5,
-        },
-        "affinity_needed": 1.0,        # concern is a Utama tag (the treatment's primary purpose)
-        "affinity_secondary": 0.5,     # concern is a Sekunder tag (a benefit named in FUNGSI)
-        "max_per_golongan": 2,
-        "top_n": 5,
-        "min_score": 30,
-        "labels": [(80, "Sangat relevan"), (50, "Relevan"), (30, "Pendukung")],
-        # R5 tie-break: when oil and pores are both affected, a treatment whose
-        # *secondary* purpose is oil comes first. The clinic's own sub-concern
-        # code is the direct marker; an oiliness tag at weight 0.5 is the same
-        # statement in the tag vocabulary, and covers the treatments whose
-        # sub-concern cell is empty.
-        #
-        # Note what the second marker costs: in the workbook every OIL-coded
-        # treatment also carries oiliness as Sekunder, so the broader marker
-        # matches strictly more treatments and the tie-break separates fewer of
-        # them. T021 and T030 are the pair it stops separating. Set this to None
-        # to go back to the sub-concern code alone.
-        "r5_oil_markers": ["OIL"],
-        "r5_oil_secondary_concern": None,
-        "proxy_options_per_rule": 3,   # proxy treatments go to related_options, not the ranking
-        "addon_golongan": "Tambahan",
-        "addon_min_score": 50,
-    },
+def _shape(value):
+    """The keys of every nested dict; leaves are not compared, because an older
+    version is allowed — expected — to hold different values."""
+    if isinstance(value, dict):
+        return {key: _shape(inner) for key, inner in value.items()}
+    return None
 
-    # --- Stage 6: guardrails ----------------------------------------------
-    "disclaimer": "Rekomendasi awal berdasarkan foto. Paket final ditentukan dokter saat konsultasi.",
-}
+
+def _load_all() -> dict:
+    found = {}
+    for module_info in pkgutil.iter_modules(rule_versions.__path__):
+        module = importlib.import_module(f"{rule_versions.__name__}.{module_info.name}")
+        rules = getattr(module, "RULES", None)
+        if not isinstance(rules, dict):
+            raise RuntimeError(f"rule_versions/{module_info.name}.py has no RULES dict.")
+        version = rules.get("version", "")
+        expected = "v" + version.replace("-", "_")
+        if module_info.name != expected:
+            raise RuntimeError(
+                f"rule_versions/{module_info.name}.py declares version {version!r}; "
+                f"its file should be named {expected}.py.")
+        _sort_key(version)
+        found[version] = rules
+    if not found:
+        raise RuntimeError("No rules versions found in recommendation/rule_versions/.")
+    return found
+
+
+AVAILABLE_VERSIONS = _load_all()
+LATEST_VERSION = max(AVAILABLE_VERSIONS, key=_sort_key)
+
+_reference = _shape(AVAILABLE_VERSIONS[LATEST_VERSION])
+for _version, _rules in AVAILABLE_VERSIONS.items():
+    if _shape(_rules) != _reference:
+        raise RuntimeError(
+            f"Rules {_version} does not have the same keys as {LATEST_VERSION}. Every "
+            f"version must carry every key, with the value that switches newer "
+            f"behaviour off — otherwise rolling back to it fails mid-request.")
+
+_HEALTH_SOURCES = ("raw_mean", "vendor_all")
+for _version, _rules in AVAILABLE_VERSIONS.items():
+    if _rules["health_source"] not in _HEALTH_SOURCES:
+        raise RuntimeError(
+            f"Rules {_version}: health_source must be one of {_HEALTH_SOURCES}, "
+            f"not {_rules['health_source']!r}.")
+
+_TIE_BREAKS = {"r5", "severity_width", "price", "id"}
+for _version, _rules in AVAILABLE_VERSIONS.items():
+    _unknown = set(_rules["ranking"]["tie_break"]) - _TIE_BREAKS
+    if _unknown:
+        raise RuntimeError(f"Rules {_version}: unknown tie_break keys {sorted(_unknown)}.")
+
+_requested = os.environ.get("RULES_VERSION", "").strip() or LATEST_VERSION
+if _requested not in AVAILABLE_VERSIONS:
+    raise RuntimeError(
+        f"RULES_VERSION={_requested!r} is not a known rules version. "
+        f"Available: {', '.join(sorted(AVAILABLE_VERSIONS, key=_sort_key))}.")
+
+RECOMMENDATION_RULES = AVAILABLE_VERSIONS[_requested]
 
 LEVEL_ORDER = {"S1": 1, "S2": 2, "S3": 3, "S4": 4}

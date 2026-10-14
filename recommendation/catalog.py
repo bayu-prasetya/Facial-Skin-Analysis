@@ -103,6 +103,10 @@ class Treatment:
     fungsi: str = ""            # shown to the patient as the description
     invasive: Optional[bool] = None   # stated by the source; None = derive it
     price: Optional[float] = None     # ordering only — never scored, never returned
+    # Treatments in the largest clinic package that contains this one. 0 = in
+    # no package; None = package data unavailable, which the score treats as
+    # neutral rather than as "in no package".
+    package_size: Optional[int] = None
 
     @property
     def is_invasive(self) -> bool:

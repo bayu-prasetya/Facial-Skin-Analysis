@@ -107,7 +107,12 @@ from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from svix.webhooks import Webhook, WebhookVerificationError
 
-from recommendation import CONCERN_ORDER, build_recommendations
+from recommendation import (
+    CONCERN_ORDER,
+    build_recommendations,
+    extract_raw_scores,
+    health_for_band,
+)
 
 load_dotenv()
 
@@ -978,12 +983,28 @@ async def check_skin_analysis_task(analysis_id: str, task_id: str) -> dict:
 
 def compute_skin_health_score(skin_metrics: dict) -> Optional[int]:
     """
-    Derive the overall skin health score from Perfect Corp's "all" metric —
-    its general skin condition score (0-100) across all analyzed concerns.
-    Returns None if that entry isn't present in the results for some reason.
+    The overall skin health score (0-100) stored and shown to clients.
+
+    It is the same number the recommendation's urgency band is read from —
+    recommendation.health_for_band under the active rules — so the score a
+    client sees and the band it produced cannot disagree. Under the current
+    rules that is the mean of the measured concerns' raw_score.
+
+    Perfect Corp's own "all" metric is not used directly: it is the exact mean
+    of the ui_scores, the display values adjusted upward, so on a face with
+    raw pore 17 it read 67 while the measurements averaged 47. Showing 67 next
+    to an "intensif" band is a number nobody can reconcile — the same reason
+    skin_metrics carries raw_score. Rolling the rules back to a version with
+    health_source "vendor_all" brings "all" back here too, consistently.
+
+    Returns None when neither a raw score nor "all" is present.
     """
-    score = _find_metric_score(skin_metrics, "all")
-    return round(score) if score is not None else None
+    raw, _ = extract_raw_scores(skin_metrics, CONCERN_ORDER)
+    measured = [c for c in CONCERN_ORDER if c in raw]
+    vendor = _find_metric_score(skin_metrics, "all")
+    if not measured and vendor is None:
+        return None
+    return round(health_for_band(raw, measured, vendor))
 
 
 # ---------------------------------------------------------------------------

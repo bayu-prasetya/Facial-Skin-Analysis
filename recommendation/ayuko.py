@@ -56,6 +56,7 @@ DEFAULT_BASE_URL = "https://ayuko-api.vercel.app"
 RECOMMENDATIONS_PATH = "/api/recommendations"
 CONCERNS_PATH = "/api/skin-concerns"
 TREATMENTS_PATH = "/api/treatments"
+PACKAGES_PATH = "/api/treatment-packages"
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
 # The whole catalog in one page; it is 112 treatments today.
@@ -65,6 +66,7 @@ TREATMENTS_PAGE_SIZE = 500
 # one is not shaped by the patient, so caching it serves nobody else's answer.
 DEFAULT_TREATMENTS_CACHE_SECONDS = 900.0
 _treatments_cache: dict = {"at": None, "by_id": None}
+_packages_cache: dict = {"at": None, "sizes": None}
 
 # The endpoint's own ceiling. Asked for in full: we re-rank locally, so a short
 # list from them would just truncate our candidates before we start.
@@ -258,6 +260,66 @@ def catalog_from_recommendations(data: dict, details: Optional[dict] = None) -> 
     return catalog if catalog.treatments else None
 
 
+async def fetch_package_sizes(client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
+    """{treatment_id: treatments in the largest active package containing it},
+    from GET /api/treatment-packages, or None on any failure.
+
+    The clinic's packages are bundles assembled to sell the treatments in them,
+    and the front end recommends packages alongside treatments, so a treatment
+    in a large package leads to more of the catalog. The score uses this as a
+    bounded sales factor; see `score_modifier` in the rules.
+
+    None is "we don't know", not "in no package": the score treats it as
+    neutral, so an unreachable endpoint never demotes every treatment at once.
+    Cached like the treatment catalog, since it is the same for every patient.
+    """
+    cached_at, sizes = _packages_cache["at"], _packages_cache["sizes"]
+    if sizes is not None and cached_at is not None and time.monotonic() - cached_at < _cache_seconds():
+        return sizes
+
+    url = f"{base_url()}{PACKAGES_PATH}?limit={TREATMENTS_PAGE_SIZE}"
+    try:
+        if client is not None:
+            response = await client.get(url)
+        else:
+            async with httpx.AsyncClient(timeout=_timeout()) as owned:
+                response = await owned.get(url)
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("ayuko-api packages could not be read: %s", e)
+        return None
+    if not response.is_success or not isinstance(body, dict) or not body.get("isSuccess"):
+        logger.warning("ayuko-api packages rejected the request (HTTP %s).", response.status_code)
+        return None
+    data = body.get("data")
+    packages = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(packages, list):
+        logger.warning("ayuko-api packages response has no item list.")
+        return None
+
+    sizes: dict = {}
+    for package in packages:
+        if not isinstance(package, dict) or package.get("isActive") is False:
+            continue
+        items = [i for i in package.get("items") or [] if isinstance(i, dict)]
+        for item in items:
+            tid = (item.get("treatment") or {}).get("id") or item.get("treatmentId")
+            if tid:
+                sizes[str(tid)] = max(sizes.get(str(tid), 0), len(items))
+    _packages_cache.update(at=time.monotonic(), sizes=sizes)
+    return sizes
+
+
+def apply_package_sizes(catalog: Catalog, sizes: Optional[dict]) -> None:
+    """Record each treatment's largest package; leave them unknown when the
+    package data could not be read, and say so in the catalog's issues."""
+    if sizes is None:
+        catalog.issues.append("package data unavailable: the package factor is neutral")
+        return
+    for tid, treatment in catalog.treatments.items():
+        treatment.package_size = sizes.get(tid, 0)
+
+
 async def full_catalog(client: Optional[httpx.AsyncClient] = None) -> Optional[Catalog]:
     """Every treatment the clinic offers, as the candidate set for our rules.
 
@@ -296,6 +358,7 @@ async def full_catalog(client: Optional[httpx.AsyncClient] = None) -> Optional[C
         catalog.issues.append(f"{needs_review} treatment flagged needsReview by the clinic")
     if not catalog.treatments:
         return None
+    apply_package_sizes(catalog, await fetch_package_sizes(client=client))
     logger.info("ayuko-api full catalog: %d treatments as candidates.", len(catalog.treatments))
     return catalog
 
