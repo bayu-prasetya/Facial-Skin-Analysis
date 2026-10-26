@@ -107,6 +107,38 @@ def at_least(lvl: Optional[str], minimum: str) -> bool:
     return lvl is not None and LEVEL_ORDER[lvl] >= LEVEL_ORDER[minimum]
 
 
+def membership(concern: str, score: Optional[float], catalog: Catalog) -> dict:
+    """{level: share} for one score, the shares summing to 1; {} when there is
+    no problem or no score.
+
+    Within `level_window` points of a boundary between two levels the score
+    belongs to both, linearly — 0.5 / 0.5 at the boundary, all one level at the
+    window's edge — so a score that sits on a line no longer flips everything
+    that reads the level (v12). Elsewhere, and with a window of 0, it is the
+    hard level alone. The 80 line ("no problem") is never blended: need starts
+    from zero there, so there is nothing to lean towards.
+    """
+    hard = level(concern, score, catalog)
+    if hard is None:
+        return {}
+    window = RECOMMENDATION_RULES["level_window"]
+    if window:
+        calibrated = catalog.thresholds.get(concern)
+        floors = ([(lvl, lo) for lvl, lo, _ in calibrated] if calibrated
+                  else list(RECOMMENDATION_RULES["default_levels"]))
+        floors.sort(key=lambda item: -item[1])
+        for (upper, edge), (lower, _) in zip(floors, floors[1:]):
+            if edge - window < score < edge + window:
+                lower_share = round((edge + window - score) / (2 * window), 3)
+                return {upper: round(1 - lower_share, 3), lower: lower_share}
+    return {hard: 1.0}
+
+
+def _share_at_least(shares: dict, minimum: str) -> float:
+    """How much of a membership sits at `minimum` or worse."""
+    return sum(v for lvl, v in shares.items() if LEVEL_ORDER[lvl] >= LEVEL_ORDER[minimum])
+
+
 def health_for_band(raw: dict, measured: list, vendor_health: Optional[float]) -> float:
     """The overall-health number the urgency band is read from.
 
@@ -136,6 +168,7 @@ def derive_signals(raw: dict, skin_health_score: Optional[float], catalog: Catal
     R, rk = RECOMMENDATION_RULES, RECOMMENDATION_RULES["ranking"]
     measured = [c for c in catalog.concerns_available if c in raw]
     lv = {c: level(c, raw[c], catalog) for c in measured}
+    shares = {c: membership(c, raw[c], catalog) for c in measured}
     # Need is how far a score sits below the "no problem" line, linearly, so
     # healthy skin always needs 0 and two concerns are directly comparable.
     need = {c: max(0.0, (rk["need_threshold"] - raw[c]) / rk["need_threshold"]) for c in measured}
@@ -144,28 +177,36 @@ def derive_signals(raw: dict, skin_health_score: Optional[float], catalog: Catal
     # concern it infers was not measured at all. Several rules may infer the
     # same concern from different sources — the strongest estimate wins, since
     # they are alternative evidence for one condition, not separate conditions
-    # to be added up. `lv` only holds measured concerns, so a source that is
+    # to be added up. `shares` only holds measured concerns, so a source that is
     # itself inferred never qualifies and proxies cannot chain.
-    active_proxies, proxy_sources = {}, {}
+    #
+    # A source near its rule's minimum level fires the rule only partly
+    # (v12): its strength is the source's membership at that level or worse,
+    # so R1 at acne 71 is a third of R1 at acne 67, not nothing.
+    active_proxies, proxy_sources, proxy_strength = {}, {}, {}
     for rule_id, concern, source, min_level, factor in R["proxy_rules"]:
-        if concern in measured or not at_least(lv.get(source), min_level):
+        strength = _share_at_least(shares.get(source, {}), min_level)
+        if concern in measured or not strength:
             continue
-        inferred = factor * need[source]
+        inferred = factor * need[source] * strength
         if inferred <= need.get(concern, 0.0):
             continue
         need[concern] = inferred
         active_proxies[concern] = rule_id
         proxy_sources[concern] = source
+        proxy_strength[concern] = strength
 
     health = health_for_band(raw, measured, skin_health_score)
     band = next(b for b in R["urgency_bands"] if health >= b[0])
     return {
         "raw": raw,
         "level": lv,
+        "membership": shares,
         "need": need,
         "measured": measured,
         "active_proxies": active_proxies,
         "proxy_sources": proxy_sources,
+        "proxy_strength": proxy_strength,
         "acne_level": lv.get("acne"),
         "r5_oil_and_pore": bool(lv.get("pore") and lv.get("oiliness")),
         "health_for_band": round(health, 2),
@@ -199,9 +240,17 @@ def passes_gates(t, sig: dict) -> bool:
     # 2. Is it safe for this user's acne right now? (R4)
     if t.is_invasive and _hide_invasive(sig):
         return False
-    # 3. Does it match this user's acne level?
-    if t.severity is not None and (sig["acne_level"] is None or sig["acne_level"] not in t.severity):
-        return False
+    # 3. Does it match this user's acne level? A range lists the acne levels
+    # the treatment suits. Since v11 it binds only a patient who has acne:
+    # without acne there is no level to be outside of, and a treatment that is
+    # itself for acne is dropped by gate 4 regardless. Since v12 a patient on
+    # the edge of two levels matches a range covering either of them.
+    if t.severity is not None:
+        if sig["acne_level"] is not None:
+            if not _range_share(t, sig):
+                return False
+        elif RECOMMENDATION_RULES["severity_range_requires_acne"]:
+            return False
     # 4. Is the user actually acne-affected, for an acne-purpose treatment?
     if "acne" in t.needed and sig["acne_level"] is None:
         return False
@@ -247,9 +296,30 @@ def score_treatment(t, sig: dict) -> Optional[dict]:
     if precision == 0:
         return None
 
+    # A treatment for the acne level the patient only leans towards (v12) is
+    # less relevant than one for the level they are mostly in. Full relevance
+    # from `level_full_share` of the patient's acne covered — any range covering
+    # the dominant level covers at least half — and linearly less below it, to
+    # nothing at the window's edge, so nothing jumps at the line. With hard
+    # levels a range covers all or nothing and this is always 1.
+    level_factor = 1.0
+    if t.severity is not None and sig["acne_level"] is not None:
+        full = RECOMMENDATION_RULES["level_full_share"]
+        level_factor = min(1.0, _range_share(t, sig) / full)
+
+    # A proxy treatment is only as relevant as the evidence for the condition
+    # it treats. With hard levels that evidence is all or nothing (1); a rule
+    # fired by a source on the edge of its level (v12) fires partly, and without
+    # this its treatments would still appear in full the moment it fired — most
+    # of their relevance comes from the measured concerns they also carry.
+    strength = 1.0
+    if is_proxy:
+        strength = max((sig.get("proxy_strength", {}).get(c, 1.0) for c in t.needed if c in proxies),
+                       default=1.0)
+
     return {
         "t": t,
-        "score": round(100 * coverage * precision),
+        "score": round(100 * coverage * precision * strength * level_factor),
         "coverage": round(coverage, 3),
         "precision": round(precision, 3),
         "concerns": [c for c, v in sorted(contrib.items(), key=lambda kv: -kv[1]) if v > 0],
@@ -277,6 +347,39 @@ def _addresses_oil_secondarily(t) -> bool:
     return bool(secondary_marker) and secondary_marker in t.secondary
 
 
+def _range_share(t, sig: dict) -> float:
+    """The share of the patient's acne membership inside a treatment's severity
+    range: 1 or 0 for a hard level, in between on the edge of two (v12)."""
+    shares = sig.get("membership", {}).get("acne") or {sig["acne_level"]: 1.0}
+    return sum(v for lvl, v in shares.items() if lvl in t.severity)
+
+
+def _severity_width(t) -> int:
+    """How many severity groups a treatment's range spans. One group per level
+    until v11, where S3 and S4 are one: the clinic treats severe acne alike at
+    both, so an S3-S4 range is as specific as a single level."""
+    groups = RECOMMENDATION_RULES["ranking"]["score_modifier"]["severity_groups"]
+    return sum(1 for group in groups if t.severity & set(group))
+
+
+def _tie_keys(sig: dict, order: list) -> list:
+    """Sort keys for equal shown scores, in the order the rules name them.
+
+    price_desc and price both put a treatment without a price last, so a
+    missing field never promotes one; featured puts the clinic's featured
+    treatments first and reads a missing flag as not featured."""
+    inf = float("inf")
+    keys = {
+        "r5": lambda s: not (sig["r5_oil_and_pore"] and _addresses_oil_secondarily(s["t"])),
+        "severity_width": lambda s: len(s["t"].severity) if s["t"].severity else 9,
+        "price": lambda s: s["t"].price if s["t"].price is not None else inf,
+        "price_desc": lambda s: -s["t"].price if s["t"].price is not None else inf,
+        "featured": lambda s: not s["t"].featured,
+        "id": lambda s: s["t"].id,
+    }
+    return [keys[k] for k in order]
+
+
 def recommendation_score(t, relevance: int, sig: dict) -> int:
     """The number shown: relevance, nudged down by at most `cap` by two factors.
 
@@ -292,11 +395,12 @@ def recommendation_score(t, relevance: int, sig: dict) -> int:
                     Gate 3 already requires the level to be inside the range;
                     a range of one level fits better than one spanning all four.
                     Neutral when the patient has no acne or the treatment no range.
-      package       a sales factor: the clinic's bundles exist to sell the
-                    treatments in them, and the front end recommends packages
-                    alongside, so a treatment in a large package leads to more of
-                    the catalog. In no package scores 0; in one, a base plus a
-                    share for its size. Neutral when the package data is missing.
+      package       a sales factor: in no package scores 0; in one, a base plus
+                    a share for its size. Neutral when the package data is
+                    missing. **Weighted 0 in every version since 2026-10-26**, at
+                    the operator's request — bundle membership no longer moves a
+                    number or an order — so F is severity_fit alone. The factor
+                    is still computed so a version could weigh it again.
 
     Bounded so it can only reorder near-ties: a relevance gap larger than `cap`
     is never overturned. It never raises a score, so nothing passes 100. The
@@ -311,7 +415,10 @@ def recommendation_score(t, relevance: int, sig: dict) -> int:
 
     factors = {}
     if sig["acne_level"] and t.severity:
-        factors["severity_fit"] = M["severity_fit"].get(len(t.severity), min(M["severity_fit"].values()))
+        # Width only. How much of a patient on the edge of two levels the range
+        # covers is already in the relevance (v12), so it is not counted here
+        # a second time.
+        factors["severity_fit"] = M["severity_fit"].get(_severity_width(t), min(M["severity_fit"].values()))
     else:
         factors["severity_fit"] = M["neutral"]
     if t.package_size is None:
@@ -348,8 +455,8 @@ def rank_treatments(sig: dict, catalog: Catalog) -> tuple[list, list]:
     # Ties, in the order `tie_break` names: R5 (oil + pore both affected ->
     # AC_*_OIL first) -> narrowest severity range (more specific to this
     # level; v9 only — from v10 that is already in the score through
-    # severity_fit, and counting it here too would count it twice) -> lowest
-    # price -> id.
+    # severity_fit, and counting it here too would count it twice) -> price
+    # -> the clinic's featured treatments (v11) -> id.
     #
     # Price is the tie-break because exact ties are common and the catalog
     # gives nothing else to separate them: the ten scar treatments all carry
@@ -358,8 +465,11 @@ def rank_treatments(sig: dict, catalog: Catalog) -> tuple[list, list]:
     # alphabetical by treatment_id and the consequence was arbitrary —
     # `canula-subsisi` at Rp3,000,000 was offered while `subsisi-mild` at
     # Rp1,500,000 never appeared in any of 625 score combinations, because c
-    # precedes s. Cheapest first is the conservative order: the lighter option
-    # is the one to try before the heavier.
+    # precedes s. v9 and v10 went cheapest first, as the conservative order.
+    # v11 goes dearest first, then featured at an equal price: that is the
+    # clinic's own answer (2026-10-24) — among treatments that fit equally,
+    # the higher price, and at the same price their featured ones. Fit itself
+    # is never traded for price; it is the score, which sorts before all this.
     #
     # Deliberately NOT ordered by invasiveness first. It reads as the safer
     # rule, but every subsisi tier is invasive, so it would bury the whole
@@ -369,13 +479,7 @@ def rank_treatments(sig: dict, catalog: Catalog) -> tuple[list, list]:
     #
     # A treatment with no price sorts last rather than first, so a missing
     # field never promotes a treatment over one whose price is known.
-    keys = {
-        "r5": lambda s: not (sig["r5_oil_and_pore"] and _addresses_oil_secondarily(s["t"])),
-        "severity_width": lambda s: len(s["t"].severity) if s["t"].severity else 9,
-        "price": lambda s: s["t"].price if s["t"].price is not None else float("inf"),
-        "id": lambda s: s["t"].id,
-    }
-    order = [keys[k] for k in rk["tie_break"]]
+    order = _tie_keys(sig, rk["tie_break"])
     scored.sort(key=lambda s: (-s["score"], *(k(s) for k in order)))
 
     top, per_golongan = [], {}
@@ -472,8 +576,9 @@ def fill_to_minimum(top: list, sig: dict, catalog: Catalog) -> tuple[list, list]
     When even that finds nothing — every measured concern at a perfect 100, so
     every need is zero against 100 as well — the picks come from the
     care_focus_concerns instead: treatments whose primary purpose is general
-    upkeep (radiance, in this catalog), held to the same five gates, cheapest
-    first, one per measured concern they also serve before any repeats.
+    upkeep (radiance, in this catalog), held to the same five gates, in the
+    ranking's tie order without R5 (dearest, then featured, since v11), one per
+    measured concern they also serve before any repeats.
     """
     M = RECOMMENDATION_RULES["maintenance"]
     rk = RECOMMENDATION_RULES["ranking"]
@@ -498,9 +603,11 @@ def fill_to_minimum(top: list, sig: dict, catalog: Catalog) -> tuple[list, list]
         s = score_treatment(t, care_sig)
         if s is None or s["proxy_rules"]:
             continue
-        s["_price"] = t.price if t.price is not None else float("inf")
         pool.append(s)
-    pool.sort(key=lambda s: (-s["score"], s["_price"], s["t"].id))
+    # The ranking's tie order without R5, which is about a finding (oil and
+    # pore both affected) and care picks are not findings.
+    order = _tie_keys(sig, [k for k in rk["tie_break"] if k != "r5"])
+    pool.sort(key=lambda s: (-s["score"], *(k(s) for k in order)))
 
     filled, used_for = list(top), []
     while len(filled) < M["min_treatments"]:
@@ -596,6 +703,8 @@ def apply_guardrails(top: list, options: list, addons: list, sig: dict, catalog:
         "needs_clinical_confirmation": True,
         "consultation_priority": priority,
         "levels": sig["level"],
+        **({"level_membership": {c: m for c, m in sig["membership"].items() if len(m) > 1}}
+           if R["level_window"] else {}),
         "active_proxy_rules": sorted(set(sig["active_proxies"].values())),
         "ranked_treatments": [
             {"rank": i + 1, "treatment_id": s["t"].id, "name": s["t"].name,

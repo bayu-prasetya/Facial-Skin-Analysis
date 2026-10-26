@@ -91,7 +91,7 @@ for _version, _rules in AVAILABLE_VERSIONS.items():
             f"Rules {_version}: health_source must be one of {_HEALTH_SOURCES}, "
             f"not {_rules['health_source']!r}.")
 
-_TIE_BREAKS = {"r5", "severity_width", "price", "id"}
+_TIE_BREAKS = {"r5", "severity_width", "price", "price_desc", "featured", "id"}
 for _version, _rules in AVAILABLE_VERSIONS.items():
     _unknown = set(_rules["ranking"]["tie_break"]) - _TIE_BREAKS
     if _unknown:

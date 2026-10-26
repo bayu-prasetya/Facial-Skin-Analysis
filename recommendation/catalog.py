@@ -103,6 +103,10 @@ class Treatment:
     fungsi: str = ""            # shown to the patient as the description
     invasive: Optional[bool] = None   # stated by the source; None = derive it
     price: Optional[float] = None     # ordering only — never scored, never returned
+    # The clinic's own featured treatments (isFeatured). Ordering only, like
+    # price: at an equal score and price the featured one goes first (v11).
+    # Missing reads as not featured, so an absent field never promotes one.
+    featured: bool = False
     # Treatments in the largest clinic package that contains this one. 0 = in
     # no package; None = package data unavailable, which the score treats as
     # neutral rather than as "in no package".
@@ -171,7 +175,8 @@ def _tag_weight(value) -> Optional[float]:
 
 def _price(value) -> Optional[float]:
     """priceNumeric arrives as a string ("1500000"). Read for ordering only:
-    equal-scoring treatments are offered cheapest first. It is never scored on
+    equal-scoring treatments are offered dearest first since v11 (cheapest
+    first in v9/v10, the order `tie_break` names). It is never scored on
     and never reaches a response."""
     if value in (None, "", "-"):
         return None
@@ -179,6 +184,13 @@ def _price(value) -> Optional[float]:
         return float(str(value).replace(",", "."))
     except ValueError:
         return None
+
+
+def _flag(value) -> bool:
+    """A boolean the source may send as true/"true"/1/"1"/"ya"."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "ya", "yes", "y")
+    return bool(value)
 
 
 def _first(row: dict, *names, default=None):
@@ -327,6 +339,7 @@ def catalog_from_rows(rows, concerns_available: Optional[list] = None,
             fungsi=_first(row, *AYUKO_DESCRIPTION_KEYS, default="") or "",
             invasive=row.get("isInvasive"),
             price=_price(_first(row, "priceNumeric", "harga", "price")),
+            featured=_flag(_first(row, "isFeatured", "unggulan", "featured")),
             needs_review=bool(row.get("needsReview") or row.get("perlu_review")),
         )
 

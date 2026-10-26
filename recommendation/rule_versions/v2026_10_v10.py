@@ -43,6 +43,8 @@ RULES = {
     # judged too lenient. A convention, not a calibration; doctor grading decides.
     "default_levels": [("S1", 70), ("S2", 55), ("S3", 40), ("S4", 0)],
     "no_problem_min": 80,
+    "level_window": 0,  # hard levels (blended near the edges from v12)
+    "level_full_share": 0.5,  # inert with hard levels: a range covers all or nothing
 
     # Which overall-health number the urgency band reads. The vendor's `all` is
     # the mean of the ui_scores, so v10 bands on the mean of the raw scores
@@ -93,6 +95,9 @@ RULES = {
     "invasive_hidden_from": "S4",
     "invasive_golongan": ["Injeksi", "Infus", "Subsisi"],
     "always_hide_invasive": False,  # True = hide them at every level
+    # Gate 3 binds a patient without acne too: any severity range shuts them
+    # out (relaxed in v11).
+    "severity_range_requires_acne": True,
 
     # --- Stages 4 and 5: relevance score, ranking, add-ons ----------------
     "ranking": {
@@ -143,7 +148,12 @@ RULES = {
         # band its own label names ("29 · Pendukung" read as a bug).
         "score_modifier": {
             "cap": 0.10,
-            "weights": {"severity_fit": 0.6, "package": 0.4},
+            # No package weight (2026-10-26, at the operator's request, in
+            # every version): bundle membership no longer moves a number or an
+            # order. F is severity_fit alone. The package keys stay so every
+            # version keeps one shape; with weight 0 they are inert.
+            "weights": {"severity_fit": 1.0, "package": 0.0},
+            "severity_groups": [["S1"], ["S2"], ["S3"], ["S4"]],  # one level each
             "severity_fit": {1: 1.0, 2: 0.67, 3: 0.33, 4: 0.0},
             "neutral": 0.5,
             "package_member_base": 0.5,

@@ -20,6 +20,8 @@ RULES = {
     # calibrated ranges in concern_levels are empty. (level, min_inclusive).
     "default_levels": [("S1", 65), ("S2", 50), ("S3", 35), ("S4", 0)],
     "no_problem_min": 80,
+    "level_window": 0,  # hard levels (blended near the edges from v12)
+    "level_full_share": 0.5,  # inert with hard levels: a range covers all or nothing
 
     # Which overall-health number the urgency band reads. v9 used the vendor's
     # `all` score as delivered (the mean of the ui_scores).
@@ -66,6 +68,9 @@ RULES = {
     "invasive_hidden_from": "S4",
     "invasive_golongan": ["Injeksi", "Infus", "Subsisi"],
     "always_hide_invasive": False,  # True = hide them at every level
+    # Gate 3 binds a patient without acne too: any severity range shuts them
+    # out (relaxed in v11).
+    "severity_range_requires_acne": True,
 
     # --- Stages 4 and 5: relevance score, ranking, add-ons ----------------
     "ranking": {
@@ -100,6 +105,7 @@ RULES = {
         "score_modifier": {
             "cap": 0.0,
             "weights": {"severity_fit": 0.5, "package": 0.5},
+            "severity_groups": [["S1"], ["S2"], ["S3"], ["S4"]],  # one level each
             "severity_fit": {1: 1.0, 2: 0.75, 3: 0.5, 4: 0.25},
             "neutral": 0.5,
             "package_member_base": 0.5,
