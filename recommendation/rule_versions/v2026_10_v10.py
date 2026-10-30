@@ -197,6 +197,11 @@ RULES = {
         # against 100 is zero. Radiance is the catalog's general-upkeep purpose:
         # every brightening/glow treatment carries it as Utama.
         "care_focus_concerns": ["radiance"],
+        # The v13 switches, holding what this version did: gate 1 as for any
+        # treatment, invasive left to gate 2, cheapest first.
+        "care_focus_statuses": ["Langsung", "Sebagian", "Proxy"],
+        "care_focus_allow_invasive": True,
+        "care_focus_order": ["price", "id"],
     },
 
     # --- Stage 6: guardrails ----------------------------------------------

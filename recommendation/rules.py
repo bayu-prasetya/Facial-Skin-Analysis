@@ -92,10 +92,16 @@ for _version, _rules in AVAILABLE_VERSIONS.items():
             f"not {_rules['health_source']!r}.")
 
 _TIE_BREAKS = {"r5", "severity_width", "price", "price_desc", "featured", "id"}
+_STATUSES = {"Langsung", "Sebagian", "Proxy", "Tidak", "N/A"}
 for _version, _rules in AVAILABLE_VERSIONS.items():
-    _unknown = set(_rules["ranking"]["tie_break"]) - _TIE_BREAKS
+    _unknown = (set(_rules["ranking"]["tie_break"]) | set(_rules["maintenance"]["care_focus_order"])) - _TIE_BREAKS
     if _unknown:
         raise RuntimeError(f"Rules {_version}: unknown tie_break keys {sorted(_unknown)}.")
+    # Gate 1 compares literally, so a misspelt status would drop every
+    # treatment without an error — the same failure AYUKO_STATUS_MAP guards.
+    _unknown = set(_rules["maintenance"]["care_focus_statuses"]) - _STATUSES
+    if _unknown:
+        raise RuntimeError(f"Rules {_version}: unknown care_focus_statuses {sorted(_unknown)}.")
 
 _requested = os.environ.get("RULES_VERSION", "").strip() or LATEST_VERSION
 if _requested not in AVAILABLE_VERSIONS:

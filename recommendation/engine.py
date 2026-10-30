@@ -226,16 +226,18 @@ def _hide_invasive(sig: dict) -> bool:
     return R["always_hide_invasive"] or at_least(sig["acne_level"], R["invasive_hidden_from"])
 
 
-def passes_gates(t, sig: dict) -> bool:
+def passes_gates(t, sig: dict, photo_statuses=("Langsung", "Sebagian", "Proxy")) -> bool:
     """The five eligibility gates from the design doc. Failing any one hides the
     treatment entirely, whatever it would have scored.
 
     Kept apart from the score so that a pick made without one — care for skin
     that measured perfect, where every need is zero — is held to exactly the
-    same gates rather than to a second copy of them.
+    same gates rather than to a second copy of them. That pick is the one
+    caller that widens gate 1 (`photo_statuses`, v13): nothing on a perfect face
+    is a finding, so whether the photo could see one does not apply.
     """
     # 1. Is the benefit visible in the photo at all?
-    if t.status not in ("Langsung", "Sebagian", "Proxy"):
+    if t.status not in photo_statuses:
         return False
     # 2. Is it safe for this user's acne right now? (R4)
     if t.is_invasive and _hide_invasive(sig):
@@ -576,9 +578,16 @@ def fill_to_minimum(top: list, sig: dict, catalog: Catalog) -> tuple[list, list]
     When even that finds nothing — every measured concern at a perfect 100, so
     every need is zero against 100 as well — the picks come from the
     care_focus_concerns instead: treatments whose primary purpose is general
-    upkeep (radiance, in this catalog), held to the same five gates, in the
-    ranking's tie order without R5 (dearest, then featured, since v11), one per
-    measured concern they also serve before any repeats.
+    upkeep (radiance, in this catalog), held to the same five gates, in
+    care_focus_order, one per measured concern they also serve before any
+    repeats. Until v13 that order was cheapest first, although the docs already
+    said dearest; v13 goes dearest, then featured, as the clinic asked.
+
+    v13 also widens gate 1 for these picks to treatments the photo does not
+    measure (care_focus_statuses) and keeps invasive ones out
+    (care_focus_allow_invasive). Almost every upkeep treatment is one the photo
+    cannot see — radiance is not measured — and the catalog of 2026-10-30
+    removed six of the seven it could, which left a perfect face with one.
     """
     M = RECOMMENDATION_RULES["maintenance"]
     rk = RECOMMENDATION_RULES["ranking"]
@@ -635,11 +644,13 @@ def fill_to_minimum(top: list, sig: dict, catalog: Catalog) -> tuple[list, list]
 
     if len(filled) < M["min_treatments"] and M["care_focus_concerns"]:
         focus = set(M["care_focus_concerns"])
+        order = _tie_keys(sig, M["care_focus_order"])
         upkeep = sorted(
             (t for t in catalog.treatments.values()
              if t.id not in taken and t.needed & focus and t.status != "Proxy"
-             and passes_gates(t, care_sig)),
-            key=lambda t: (t.price if t.price is not None else float("inf"), t.id))
+             and (M["care_focus_allow_invasive"] or not t.is_invasive)
+             and passes_gates(t, care_sig, photo_statuses=M["care_focus_statuses"])),
+            key=lambda t: tuple(k({"t": t}) for k in order))
         for concern in lowest + [None]:   # one per measured concern, then anything left
             for t in upkeep:
                 if len(filled) >= M["min_treatments"]:

@@ -130,6 +130,10 @@ RULES = {
         "perfect_score": 100,
         "label": "Perawatan",
         "care_focus_concerns": [],
+        # v13 switches, inert here: there is no care focus to apply them to.
+        "care_focus_statuses": ["Langsung", "Sebagian", "Proxy"],
+        "care_focus_allow_invasive": True,
+        "care_focus_order": ["price", "id"],
     },
 
     # --- Stage 6: guardrails ----------------------------------------------
