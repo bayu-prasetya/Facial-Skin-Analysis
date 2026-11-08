@@ -783,6 +783,38 @@ class PerfectCorpTimeout(PerfectCorpError):
     POST /analyze can distinguish 504 (vendor slow) from 502 (vendor refused)."""
 
 
+class PerfectCorpAccountError(PerfectCorpError):
+    """Our Perfect Corp account cannot run tasks: out of credits, or its
+    credentials were refused. Nothing about the photo, and nothing a retry
+    fixes until the operator acts, so POST /analyze answers 503 rather than the
+    502 whose wording ("could not accept the photo") apps read as a bad photo.
+    Seen live 2026-11-08: task creation answered 400 with error_code
+    "CreditInsufficiency" on every submission, and the testers were told their
+    photo was too dark and badly framed."""
+
+
+# error_code values that mean the account, not the photo or the request, is the
+# problem. Perfect Corp's docs list none of these for running out of credits;
+# CreditInsufficiency is taken from the live response above, the other two from
+# the documented 401 bodies of their credit API.
+PERFECT_CORP_ACCOUNT_ERROR_CODES = {"CreditInsufficiency", "InvalidApiKey", "InvalidAccessToken"}
+
+
+def _vendor_status_error(step: str, e: httpx.HTTPStatusError) -> PerfectCorpError:
+    """The exception for a non-2xx Perfect Corp answer, with the body kept for the
+    log. Account problems are told apart by error_code, not by HTTP status:
+    running out of credits arrives as a plain 400."""
+    response = e.response
+    try:
+        error_code = response.json().get("error_code")
+    except (ValueError, AttributeError):
+        error_code = None
+    message = f"Perfect Corp {step} returned {response.status_code}: {response.text}"
+    if error_code in PERFECT_CORP_ACCOUNT_ERROR_CODES or response.status_code == 401:
+        return PerfectCorpAccountError(message)
+    return PerfectCorpError(message)
+
+
 def _get_perfect_corp_credentials() -> tuple[str, str]:
     api_key = os.environ.get("PERFECT_CORP_API_KEY")
     base_url = os.environ.get("PERFECT_CORP_API_BASE_URL")
@@ -809,9 +841,7 @@ async def _register_file(
     except httpx.TimeoutException as e:
         raise PerfectCorpTimeout(f"Perfect Corp file registration timed out: {e}") from e
     except httpx.HTTPStatusError as e:
-        raise PerfectCorpError(
-            f"Perfect Corp file registration returned {e.response.status_code}: {e.response.text}"
-        ) from e
+        raise _vendor_status_error("file registration", e) from e
     except httpx.RequestError as e:
         raise PerfectCorpError(
             f"Could not reach Perfect Corp for file registration: {e!r}"
@@ -865,9 +895,7 @@ async def _create_skin_analysis_task(client: httpx.AsyncClient, api_key: str, fi
     except httpx.TimeoutException as e:
         raise PerfectCorpTimeout(f"Perfect Corp task creation timed out: {e}") from e
     except httpx.HTTPStatusError as e:
-        raise PerfectCorpError(
-            f"Perfect Corp task creation returned {e.response.status_code}: {e.response.text}"
-        ) from e
+        raise _vendor_status_error("task creation", e) from e
     except httpx.RequestError as e:
         raise PerfectCorpError(
             f"Could not reach Perfect Corp for task creation: {e!r}"
@@ -891,9 +919,7 @@ async def _fetch_skin_analysis_task(client: httpx.AsyncClient, api_key: str, tas
     except httpx.TimeoutException as e:
         raise PerfectCorpTimeout(f"Perfect Corp task status check timed out: {e}") from e
     except httpx.HTTPStatusError as e:
-        raise PerfectCorpError(
-            f"Perfect Corp task status check returned {e.response.status_code}: {e.response.text}"
-        ) from e
+        raise _vendor_status_error("task status check", e) from e
     except httpx.RequestError as e:
         raise PerfectCorpError(
             f"Could not reach Perfect Corp for task status check: {e!r}"
@@ -936,6 +962,12 @@ async def check_skin_analysis_task(analysis_id: str, task_id: str) -> dict:
         api_key, base_url = _get_perfect_corp_credentials()
         async with httpx.AsyncClient(base_url=base_url, timeout=PERFECT_CORP_TIMEOUT_SECONDS) as client:
             data = await _fetch_skin_analysis_task(client, api_key, task_id)
+    except PerfectCorpAccountError as e:
+        # Our credentials, not the task: the task may well have succeeded and
+        # been paid for. Marking it failed would discard that result for good,
+        # so it stays pending and the next poll or webhook retry checks again.
+        logger.error("Perfect Corp refused our account during a status check: %s", e)
+        return await _get_analysis_record(analysis_id)
     except PerfectCorpError as e:
         await _mark_failed(analysis_id, str(e))
         return await _get_analysis_record(analysis_id)
@@ -1076,7 +1108,15 @@ async def compute_product_recommendations(
         500: {"model": ErrorDetail, "description": "Could not record the analysis."},
         502: {
             "model": ErrorDetail,
-            "description": "Perfect Corp refused the upload or returned an error. Safe to retry.",
+            "description": "Perfect Corp returned an error. Not a problem with the photo. Safe to retry.",
+        },
+        503: {
+            "model": ErrorDetail,
+            "description": (
+                "The analysis service is unavailable on our side (e.g. the provider "
+                "account is out of credits). Not a problem with the photo; retrying "
+                "will not help until the operator restores the service."
+            ),
         },
         504: {
             "model": ErrorDetail,
@@ -1124,11 +1164,25 @@ async def analyze_photo(
             status_code=504,
             detail="The analysis provider did not respond in time. Safe to retry.",
         ) from e
+    except PerfectCorpAccountError as e:
+        # Every submission fails the same way until someone tops up the credits
+        # or fixes the key, so this is an error for the operator, not a warning.
+        logger.error("Perfect Corp refused our account; no analysis can run: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The analysis service is temporarily unavailable. This is not a problem "
+                "with the photo; please try again later."
+            ),
+        ) from e
     except PerfectCorpError as e:
+        # Nothing at this stage judges the photo: Perfect Corp reports a dark or
+        # badly framed face later, as task_status "error". So the reply must not
+        # blame the photo — "could not accept the photo" was read as exactly that.
         logger.warning("Perfect Corp rejected the submission: %s", e)
         raise HTTPException(
             status_code=502,
-            detail="The analysis provider could not accept the photo. Safe to retry.",
+            detail="The analysis provider returned an error. This is not a problem with the photo. Safe to retry.",
         ) from e
 
     # --- Stage 3: persist the task_id in the same request that created it ---
